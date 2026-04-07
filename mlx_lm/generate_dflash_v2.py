@@ -324,16 +324,17 @@ def block_diffusion_generate_step(
             # Add the target token
             accumulated_tokens.append(target_token.item())
 
-            # Append new tokens to target_hidden (keep growing context)
-            # This differs from reference but seems necessary for our implementation
-            # Extract hidden states for positions 1 to acceptance_length+1 (skip position 0 which is seed token)
+            # Update target_hidden with new tokens
+            # Reference: target_hidden = extract_context_feature(...)[:, :acceptance_length + 1, :]
+            # This includes seed token (position 0) + accepted drafts (positions 1..acceptance_length)
+            # Does NOT include the target token at position acceptance_length+1
 
             new_hidden_states = []
             for layer_id in draft_model.target_layer_ids:
                 # hidden_states has embedding at index 0, layers at 1..33
                 layer_hidden = target_model_with_hidden.hidden_states[layer_id + 1]
-                # Extract positions 1..acceptance_length+1 (accepted drafts + target token, skip seed)
-                new_hidden = layer_hidden[:, 1:acceptance_length + 2, :]
+                # Take positions 0..acceptance_length (seed + accepted drafts)
+                new_hidden = layer_hidden[:, :acceptance_length + 1, :]
                 new_hidden_states.append(new_hidden)
 
             # Append new context to target_hidden
