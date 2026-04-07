@@ -2052,7 +2052,10 @@ def main():
 
     if args.draft_model is not None:
         draft_model, draft_tokenizer = load(args.draft_model)
-        if draft_tokenizer.vocab_size != tokenizer.vocab_size:
+        # DFlash draft models may have different vocab_size due to broken configs
+        # Skip check for DFlash models (detected by block_size)
+        is_dflash = args.block_size is not None and hasattr(draft_model, 'block_size')
+        if not is_dflash and draft_tokenizer.vocab_size != tokenizer.vocab_size:
             raise ValueError("Draft model tokenizer does not match model tokenizer.")
     else:
         draft_model = None
