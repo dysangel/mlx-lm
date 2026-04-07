@@ -169,9 +169,9 @@ def block_diffusion_generate_step(
 
     # Initialize caches
     model_cache = model.make_cache()
-    # Don't reuse draft_cache across blocks to avoid position mismatch
-    # Each block creates its own cache
-    draft_cache = None
+    # Reuse draft cache across iterations (like reference)
+    # We'll crop it each iteration to avoid position mismatch
+    draft_cache = draft_model.make_cache()
 
     # Prefill stage - capture context features from target model
     target_model_with_hidden = ModelWithHiddenStates(model, draft_model.target_layer_ids)
@@ -239,12 +239,12 @@ def block_diffusion_generate_step(
             block_ids = mx.full([current_block_size], mask_token_id, dtype=mx.uint32)
             noise_embedding = target_inner.embed_tokens(block_ids)[None, ...]
 
-            # Draft model generates
+            # Draft model generates (reusing cache like reference)
             draft_output = draft_model(
                 position_ids=position_ids,
                 noise_embedding=noise_embedding,
                 target_hidden=target_hidden,
-                cache=None,  # Fresh cache for each block
+                cache=draft_cache,
             )
 
             # Get draft logits using target model's lm_head
@@ -257,6 +257,13 @@ def block_diffusion_generate_step(
             # The draft model outputs block_size positions, where position 0 is unused
             # and positions 1 to block_size-1 contain the actual draft predictions
             draft_tokens_block = sampler(draft_logits[:, -current_block_size + 1:, :]).squeeze(0)
+
+            # Trim draft cache to current position (like reference's crop)
+            # This prevents position mismatch across iterations
+            current_seq_len = ntoks + len(prompt_tokens.squeeze(0))
+            for c in draft_cache:
+                if hasattr(c, 'trim') and c.size() > current_seq_len:
+                    c.trim(c.size() - current_seq_len)
 
             # For verification, we need: [first_token, draft_token_0, draft_token_1, ...]
             # The target model will predict next tokens for each position
@@ -317,26 +324,19 @@ def block_diffusion_generate_step(
             # Add the target token
             accumulated_tokens.append(target_token.item())
 
-            # Incremental update: extract only new hidden states from target_output
-            # target_output.hidden_states contains hidden states for all draft_tokens positions
-            # Position 0 is the seed token, positions 1..acceptance_length are accepted draft tokens
-            # Position acceptance_length is the target token we just sampled
+            # Append new tokens to target_hidden (keep growing context)
+            # This differs from reference but seems necessary for our implementation
+            # Extract hidden states for positions 1 to acceptance_length+1 (skip position 0 which is seed token)
 
-            # Extract hidden states for accepted draft tokens (positions 1 to acceptance_length)
             new_hidden_states = []
             for layer_id in draft_model.target_layer_ids:
                 # hidden_states has embedding at index 0, layers at 1..33
-                # We need to get the layer at layer_id
                 layer_hidden = target_model_with_hidden.hidden_states[layer_id + 1]
-                # Extract positions 1..acceptance_length (accepted draft tokens)
-                accepted_hidden = layer_hidden[:, 1:acceptance_length + 1, :]
-                # Extract position acceptance_length (target token)
-                target_hidden_single = layer_hidden[:, acceptance_length:acceptance_length + 1, :]
-                # Concatenate: accepted + target
-                new_hidden = mx.concatenate([accepted_hidden, target_hidden_single], axis=1)
+                # Extract positions 1..acceptance_length+1 (accepted drafts + target token, skip seed)
+                new_hidden = layer_hidden[:, 1:acceptance_length + 2, :]
                 new_hidden_states.append(new_hidden)
 
-            # Concatenate all layers and append to target_hidden
-            if new_hidden_states:
+            # Append new context to target_hidden
+            if new_hidden_states and new_hidden_states[0].shape[1] > 0:
                 new_target_hidden = mx.concatenate(new_hidden_states, axis=-1)
                 target_hidden = mx.concatenate([target_hidden, new_target_hidden], axis=1)
