@@ -279,17 +279,33 @@ def block_diffusion_generate_step(
             # Update first_token
             first_token = target_token
 
-            # Accumulate all generated tokens and rebuild target_hidden
+            # Accumulate all generated tokens and update target_hidden incrementally
             # Add accepted draft tokens
             for i in range(acceptance_length):
                 accumulated_tokens.append(draft_tokens[i + 1].item())
             # Add the target token
             accumulated_tokens.append(target_token.item())
 
-            # Rebuild target_hidden from full accumulated sequence
-            accumulated_tokens_mx = mx.array(accumulated_tokens)[None, :]
-            _ = target_model_with_hidden(accumulated_tokens_mx, cache=None)
-            target_hidden = extract_context_feature(
-                target_model_with_hidden.hidden_states,
-                draft_model.target_layer_ids,
-            )
+            # Incremental update: extract only new hidden states from target_output
+            # target_output.hidden_states contains hidden states for all draft_tokens positions
+            # Position 0 is the seed token, positions 1..acceptance_length are accepted draft tokens
+            # Position acceptance_length is the target token we just sampled
+
+            # Extract hidden states for accepted draft tokens (positions 1 to acceptance_length)
+            new_hidden_states = []
+            for layer_id in draft_model.target_layer_ids:
+                # hidden_states has embedding at index 0, layers at 1..33
+                # We need to get the layer at layer_id
+                layer_hidden = target_model_with_hidden.hidden_states[layer_id + 1]
+                # Extract positions 1..acceptance_length (accepted draft tokens)
+                accepted_hidden = layer_hidden[:, 1:acceptance_length + 1, :]
+                # Extract position acceptance_length (target token)
+                target_hidden_single = layer_hidden[:, acceptance_length:acceptance_length + 1, :]
+                # Concatenate: accepted + target
+                new_hidden = mx.concatenate([accepted_hidden, target_hidden_single], axis=1)
+                new_hidden_states.append(new_hidden)
+
+            # Concatenate all layers and append to target_hidden
+            if new_hidden_states:
+                new_target_hidden = mx.concatenate(new_hidden_states, axis=-1)
+                target_hidden = mx.concatenate([target_hidden, new_target_hidden], axis=1)
