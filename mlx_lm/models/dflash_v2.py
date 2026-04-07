@@ -152,7 +152,7 @@ class DFlashAttention(nn.Module):
         Args:
             hidden_states: Noise embeddings [B, L, D]
             target_hidden: Compressed context features [B, ctx_len, D]
-            position_embeddings: (cos, sin) for RoPE
+            position_embeddings: (cos, sin) for RoPE - computed for ALL positions
             mask: Attention mask
             cache: KV cache
         """
@@ -179,16 +179,35 @@ class DFlashAttention(nn.Module):
         v = v.transpose(0, 2, 1, 3)
 
         # Apply RoPE
+        # Q (noise tokens) should get RoPE for positions [ctx_len, ctx_len+L)
+        # K (context + noise) should get RoPE for positions [0, ctx_len+L)
         cos, sin = position_embeddings
-        queries, k = apply_rotary_pos_emb(queries, k, cos, sin)
+        # Expand cos/sin for broadcasting
+        cos = mx.expand_dims(cos, 0)
+        cos = mx.expand_dims(cos, 0)
+        sin = mx.expand_dims(sin, 0)
+        sin = mx.expand_dims(sin, 0)
+        # Concatenate cos/sin with themselves to match head_dim
+        cos = mx.concatenate([cos, cos], axis=-1)
+        sin = mx.concatenate([sin, sin], axis=-1)
+
+        # Q gets RoPE for the LAST L positions (which are the noise token positions)
+        cos_q = cos[..., -L:, :]
+        sin_q = sin[..., -L:, :]
+        # K gets RoPE for ALL positions
+        cos_k = cos[..., -k.shape[-2]:, :]
+        sin_k = sin[..., -k.shape[-2]:, :]
+
+        q_embed = (queries * cos_q) + (rotate_half(queries) * sin_q)
+        k_embed = (k * cos_k) + (rotate_half(k) * sin_k)
 
         # Update cache
         if cache is not None:
-            k, v = cache.update_and_fetch(k, v)
+            k_embed, v = cache.update_and_fetch(k_embed, v)
 
         # Scaled dot-product attention
         output = scaled_dot_product_attention(
-            queries, k, v, cache=cache, scale=self.scaling, mask=mask
+            q_embed, k_embed, v, cache=cache, scale=self.scaling, mask=mask
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)

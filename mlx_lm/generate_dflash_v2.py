@@ -213,9 +213,14 @@ def block_diffusion_generate_step(
         current_block_size = min(block_size, remaining)
 
         with mx.stream(generation_stream):
-            # Create position_ids covering ALL positions (context + noise)
-            # The draft model's K attends to both context (from target_hidden) and noise
-            total_positions = len(accumulated_tokens) + current_block_size
+            # Create position_ids for the draft model
+            # Position IDs should cover: [context positions, noise positions]
+            # But the draft model processes noise tokens, and attends to target_hidden (context) + noise
+            # So position_ids need to cover both context and noise positions
+            # However, the position_ids are used to compute RoPE, and noise Q/K should get
+            # the correct RoPE for their global positions
+            ctx_len = target_hidden.shape[1]
+            total_positions = ctx_len + current_block_size
             position_ids = mx.arange(0, total_positions)[None, :]
 
             # Create mask token embeddings
