@@ -63,10 +63,15 @@ class ModelWithHiddenStates(nn.Module):
         """Forward pass that captures intermediate hidden states."""
         self.hidden_states = []
 
-        # Get the inner model
+        # Get the inner model - need to handle different model architectures
+        # Some models have: Model -> language_model(TextModel) -> model(Qwen3_5TextModel) -> layers
+        # Others have: Model -> language_model(TextModel) -> layers
         inner_model = self.model
         if hasattr(inner_model, 'language_model'):
             inner_model = inner_model.language_model
+        # Store reference to the potential lm_head container
+        lm_head_container = inner_model
+        # Navigate to the actual model with layers
         if hasattr(inner_model, 'model'):
             inner_model = inner_model.model
 
@@ -90,10 +95,12 @@ class ModelWithHiddenStates(nn.Module):
         # Final normalization
         h = inner_model.norm(h)
 
-        # Get logits
-        if hasattr(self.model.args, "tie_word_embeddings") and self.model.args.tie_word_embeddings:
+        # Get logits - check lm_head_container for tie_word_embeddings and lm_head
+        if hasattr(lm_head_container, "args") and hasattr(lm_head_container.args, "tie_word_embeddings") and lm_head_container.args.tie_word_embeddings:
             logits = inner_model.embed_tokens.as_linear(h)
-        elif hasattr(self.model, 'lm_head'):
+        elif hasattr(lm_head_container, "lm_head"):
+            logits = lm_head_container.lm_head(h)
+        elif hasattr(self.model, "lm_head"):
             logits = self.model.lm_head(h)
         else:
             logits = inner_model.embed_tokens.as_linear(h)
@@ -176,7 +183,7 @@ def block_diffusion_generate_step(
 
     # Yield first token
     first_token = tokens[-1].item()
-    first_logprobs = logprobs[-1:]
+    first_logprobs = logprobs[-1]
     yield first_token, first_logprobs, False
     ntoks = 1
 
@@ -230,13 +237,19 @@ def block_diffusion_generate_step(
                 draft_logits = target_inner.embed_tokens.as_linear(draft_output)
 
             # Sample draft tokens (skip first position which is for the seed token)
+            # The draft model outputs block_size positions, where position 0 is unused
+            # and positions 1 to block_size-1 contain the actual draft predictions
             draft_tokens_block = sampler(draft_logits[:, -current_block_size + 1:, :]).squeeze(0)
 
-            # Prepend first token from previous iteration
-            draft_tokens = mx.concatenate([mx.array([first_token]), draft_tokens_block])
+            # For verification, we need: [first_token, draft_token_0, draft_token_1, ...]
+            # The target model will predict next tokens for each position
+            draft_tokens_for_target = mx.concatenate([mx.array([first_token]), draft_tokens_block])
+
+            # Convert draft_logits to logprobs for yielding
+            draft_logprobs = draft_logits - mx.logsumexp(draft_logits, axis=-1, keepdims=True)
 
             # Target model verifies draft tokens
-            target_output = target_model_with_hidden(draft_tokens[None], cache=model_cache)
+            target_output = target_model_with_hidden(draft_tokens_for_target[None], cache=model_cache)
             quantize_cache_fn(model_cache)
 
             # Use argmax for verification
@@ -246,10 +259,10 @@ def block_diffusion_generate_step(
             target_tokens_sampled = sampler(target_output.logits).squeeze(0)
 
             # Find acceptance length
-            draft_to_verify = draft_tokens[1:]
-            target_values = target_tokens_block[:-1]
+            # Compare: draft_tokens_block[0,1,2,...] vs target_tokens_block[1,2,3,...]
+            # i.e., compare each draft token with target's prediction at that position
             acceptance_length = (
-                mx.cumsum(draft_to_verify == target_values) == mx.arange(1, current_block_size)
+                mx.cumsum(draft_tokens_block == target_tokens_block[:-1]) == mx.arange(1, len(draft_tokens_block) + 1)
             ).sum()
             acceptance_length = int(acceptance_length)
 
@@ -260,7 +273,7 @@ def block_diffusion_generate_step(
 
             # Yield accepted draft tokens
             for i in range(acceptance_length):
-                yield draft_tokens[i + 1].item(), draft_logits[:, i, :], True
+                yield draft_tokens_block[i].item(), draft_logprobs[:, i, :].squeeze(0), True
                 ntoks += 1
                 if ntoks >= max_tokens:
                     break
@@ -270,19 +283,20 @@ def block_diffusion_generate_step(
 
             # Yield one target token
             target_token = target_tokens_sampled[acceptance_length]
-            yield target_token.item(), target_output.logits[:, acceptance_length, :], False
+            target_logprobs = target_output.logits - mx.logsumexp(target_output.logits, axis=-1, keepdims=True)
+            yield target_token.item(), target_logprobs[:, acceptance_length, :].squeeze(0), False
             ntoks += 1
 
             if ntoks >= max_tokens:
                 break
 
-            # Update first_token
+            # Update first_token for next iteration
             first_token = target_token
 
             # Accumulate all generated tokens and update target_hidden incrementally
             # Add accepted draft tokens
             for i in range(acceptance_length):
-                accumulated_tokens.append(draft_tokens[i + 1].item())
+                accumulated_tokens.append(draft_tokens_block[i].item())
             # Add the target token
             accumulated_tokens.append(target_token.item())
 

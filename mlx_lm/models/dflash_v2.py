@@ -14,6 +14,21 @@ from .base import scaled_dot_product_attention
 from .activations import swiglu
 
 
+def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> List[int]:
+    """Build target_layer_ids for DFlash draft model.
+
+    Selects layer indices spread across the target model to extract features from.
+    """
+    if num_draft_layers == 1:
+        return [(num_target_layers // 2)]
+    start = 1
+    end = num_target_layers - 3
+    span = end - start
+    return [
+        int(round(start + (i * span) / (num_draft_layers - 1)))
+        for i in range(num_draft_layers)
+    ]
+
 def rotate_half(x: mx.array) -> mx.array:
     """Rotates half the hidden dims of the input."""
     x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
@@ -35,11 +50,14 @@ def apply_rotary_pos_emb(
     sin = mx.concatenate([sin, sin], axis=-1)
 
     q_len = q.shape[-2]
+    k_len = k.shape[-2]
     cos_q = cos[..., -q_len:, :]
     sin_q = sin[..., -q_len:, :]
+    cos_k = cos[..., -k_len:, :]
+    sin_k = sin[..., -k_len:, :]
 
     q_embed = (q * cos_q) + (rotate_half(q) * sin_q)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    k_embed = (k * cos_k) + (rotate_half(k) * sin_k)
 
     return q_embed, k_embed
 
@@ -269,7 +287,13 @@ class Model(nn.Module):
         # Expose key attributes
         self.block_size = args.block_size
         self.mask_token_id = args.mask_token_id
-        self.target_layer_ids = args.target_layer_ids or [0]
+        # Build target_layer_ids if not specified in config
+        if args.target_layer_ids is None:
+            self.target_layer_ids = build_target_layer_ids(
+                args.num_target_layers, args.num_hidden_layers
+            )
+        else:
+            self.target_layer_ids = args.target_layer_ids
         self.model_type = args.model_type
 
         # Create decoder layers

@@ -182,6 +182,7 @@ class GenerationArguments:
 
     max_tokens: int
     num_draft_tokens: int
+    block_size: Optional[int]
     logprobs: bool
     top_logprobs: int
     seed: Optional[int]
@@ -963,6 +964,7 @@ class ResponseGenerator:
                 prompt_cache=cache,
                 draft_model=draft_model,
                 num_draft_tokens=args.num_draft_tokens,
+                block_size=args.block_size,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
             ):
@@ -1392,6 +1394,7 @@ class APIHandler(BaseHTTPRequestHandler):
             stop_words=stop_words,
             max_tokens=self.max_tokens,
             num_draft_tokens=self.num_draft_tokens,
+            block_size=self.response_generator.cli_args.block_size,
             logprobs=self.logprobs,
             top_logprobs=self.top_logprobs,
             seed=self.seed,
@@ -1775,6 +1778,12 @@ def main():
         "--draft-model",
         type=str,
         help="A model to be used for speculative decoding.",
+        default=None,
+    )
+    parser.add_argument(
+        "--block-size",
+        type=int,
+        help="Block size for DFlash block diffusion speculative decoding.",
         default=None,
     )
     parser.add_argument(
