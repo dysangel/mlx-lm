@@ -179,8 +179,26 @@ class DFlashAttention(nn.Module):
         v = v.transpose(0, 2, 1, 3)
 
         # Apply RoPE
-        # Q (noise tokens) should get RoPE for positions [ctx_len, ctx_len+L)
-        # K (context + noise) should get RoPE for positions [0, ctx_len+L)
+        # Q (noise tokens) should get RoPE for positions [global_pos, global_pos+L)
+        # K is [context, noise] where context has length ctx_len
+        # K positions [0, ctx_len) are context keys (should get RoPE for [0, ctx_len))
+        # K positions [ctx_len, ctx_len+L) are noise keys (should get RoPE for [global_pos, global_pos+L))
+
+        # We need to know the global position of the noise tokens
+        # This is NOT ctx_len, but rather the position in the global sequence
+        # We can infer this from the fact that noise tokens come after all accumulated tokens
+        # So the global position is ctx_len (number of accumulated tokens)
+
+        # Actually, we need to pass the global position offset to this function
+        # For now, we can infer it: the noise tokens start at position ctx_len in the global sequence
+        # because the context (target_hidden) has length ctx_len
+
+        # Wait, that's not right either. Let me think again...
+        # target_hidden contains hidden states for accumulated_tokens
+        # So ctx_len = len(accumulated_tokens) = global position of next token
+
+        # Therefore, noise tokens should get RoPE for positions [ctx_len, ctx_len+L)
+
         cos, sin = position_embeddings
         # Expand cos/sin for broadcasting
         cos = mx.expand_dims(cos, 0)
@@ -194,9 +212,29 @@ class DFlashAttention(nn.Module):
         # Q gets RoPE for the LAST L positions (which are the noise token positions)
         cos_q = cos[..., -L:, :]
         sin_q = sin[..., -L:, :]
-        # K gets RoPE for ALL positions
-        cos_k = cos[..., -k.shape[-2]:, :]
-        sin_k = sin[..., -k.shape[-2]:, :]
+
+        # K is [context, noise] where:
+        # - K[0:ctx_len] are context keys (should get RoPE for [0, ctx_len))
+        # - K[ctx_len:ctx_len+L] are noise keys (should get RoPE for [ctx_len, ctx_len+L))
+
+        # So context keys get cos[..., :ctx_len, :]
+        # And noise keys get cos[..., ctx_len:ctx_len+L, :]
+        # But we need to be careful about the slicing
+
+        # Context keys get RoPE for positions [0, ctx_len)
+        cos_k_context = cos[..., :ctx_len, :]
+        sin_k_context = sin[..., :ctx_len, :]
+
+        # Noise keys get RoPE for positions [ctx_len, ctx_len+L)
+        # But we need to slice cos correctly
+        # cos has shape [1, 1, total_positions, head_dim]
+        # We need positions [ctx_len, ctx_len+L)
+        cos_k_noise = cos[..., ctx_len:ctx_len + L, :]
+        sin_k_noise = sin[..., ctx_len:ctx_len + L, :]
+
+        # Concatenate context and noise RoPE
+        cos_k = mx.concatenate([cos_k_context, cos_k_noise], axis=-2)
+        sin_k = mx.concatenate([sin_k_context, sin_k_noise], axis=-2)
 
         q_embed = (queries * cos_q) + (rotate_half(queries) * sin_q)
         k_embed = (k * cos_k) + (rotate_half(k) * sin_k)

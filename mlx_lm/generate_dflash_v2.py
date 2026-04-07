@@ -214,13 +214,25 @@ def block_diffusion_generate_step(
 
         with mx.stream(generation_stream):
             # Create position_ids for the draft model
-            # Position IDs should cover: [context positions, noise positions]
-            # But the draft model processes noise tokens, and attends to target_hidden (context) + noise
-            # So position_ids need to cover both context and noise positions
-            # However, the position_ids are used to compute RoPE, and noise Q/K should get
-            # the correct RoPE for their global positions
-            ctx_len = target_hidden.shape[1]
-            total_positions = ctx_len + current_block_size
+            # In the reference, position_ids are GLOBAL positions in the output sequence
+            # The noise tokens start at position len(accumulated_tokens)
+            # The position_ids should cover ALL positions that K will attend to (context + noise)
+            # But the noise tokens are at positions [len(accumulated_tokens), len(accumulated_tokens) + block_size)
+            # And the context is at positions [0, len(accumulated_tokens))
+
+            # The key insight: position_ids should start from 0 and cover all positions
+            # But the noise tokens' GLOBAL position is len(accumulated_tokens)
+            # So we need position_ids = [0, 1, ..., len(accumulated_tokens) + block_size - 1]
+
+            # Actually, looking at the reference more carefully:
+            # position_ids = position_ids[:, start:start + block_size] where start = len(output_ids) in global sequence
+            # This gives position_ids for the noise tokens at their global positions
+
+            # But the draft model also needs position embeddings for the context tokens (in K)
+            # So we need position_ids for ALL positions: [0, len(accumulated_tokens) + block_size)
+
+            global_pos = len(accumulated_tokens)
+            total_positions = global_pos + current_block_size
             position_ids = mx.arange(0, total_positions)[None, :]
 
             # Create mask token embeddings
