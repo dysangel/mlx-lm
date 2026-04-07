@@ -326,7 +326,7 @@ class RoPE(nn.Module):
         t = position_ids[:, None]  # (seq_len, 1)
         freqs = t * inv_freq[None, :]  # (seq_len, rotary_dim/2)
 
-        emb = mx.concatenate([mx.sin(freqs), mx.cos(freqs)], axis=-1)  # (seq_len, rotary_dim)
+        emb = mx.concatenate([mx.cos(freqs), mx.sin(freqs)], axis=-1)  # (seq_len, rotary_dim)
 
         cos = emb[:, : emb.shape[-1] // 2]  # (seq_len, rotary_dim/2)
         sin = emb[:, emb.shape[-1] // 2 :]  # (seq_len, rotary_dim/2)
