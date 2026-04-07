@@ -239,13 +239,29 @@ class DFlashAttention(nn.Module):
         q_embed = (queries * cos_q) + (rotate_half(queries) * sin_q)
         k_embed = (k * cos_k) + (rotate_half(k) * sin_k)
 
-        # Update cache
+        # Update cache with ONLY noise tokens (not context)
+        # The context (from target_hidden) changes each iteration and shouldn't be cached
+        # Only cache the noise tokens which provide persistent context
         if cache is not None:
-            k_embed, v = cache.update_and_fetch(k_embed, v)
+            # Split k_embed and v into context and noise parts
+            # k_embed and v have shape [B, n_heads, ctx_len + L, head_dim]
+            # Context is [:, :, :ctx_len, :], noise is [:, :, ctx_len:, :]
+
+            k_noise = k_embed[:, :, ctx_len:, :]
+            v_noise = v[:, :, ctx_len:, :]
+
+            # Cache only noise tokens
+            k_cached, v_cached = cache.update_and_fetch(k_noise, v_noise)
+
+            # For attention, we need K = [context, cached_noise]
+            # But the cache returns ALL cached noise, not just current iteration
+            # So K = [context_keys, all_cached_noise_keys]
+            k_embed = mx.concatenate([k_embed[:, :, :ctx_len, :], k_cached], axis=2)
+            v = mx.concatenate([v[:, :, :ctx_len, :], v_cached], axis=2)
 
         # Scaled dot-product attention
         output = scaled_dot_product_attention(
-            q_embed, k_embed, v, cache=cache, scale=self.scaling, mask=mask
+            q_embed, k_embed, v, cache=None, scale=self.scaling, mask=mask
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)

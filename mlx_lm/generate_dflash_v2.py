@@ -196,48 +196,43 @@ def block_diffusion_generate_step(
     # Get inner model for embeddings
     target_inner = get_inner_model(model)
 
-    # Track all generated tokens for rebuilding target_hidden
-    accumulated_tokens = list(prompt_tokens.squeeze(0).tolist()) + [first_token]
+    # Initialize output_ids like the reference
+    # output_ids contains: [prompt_tokens, first_token, mask_tokens..., generated_tokens...]
+    max_length = num_input_tokens + max_tokens + block_size
+    output_ids = mx.full([1, max_length], mask_token_id, dtype=mx.uint32)
+    output_ids[:, :num_input_tokens] = prompt_tokens
+    output_ids[:, num_input_tokens] = first_token
 
+    # Position for next token
+    start = num_input_tokens + 1
+
+    # Extract context features from target model
     # Rebuild target_hidden from full accumulated sequence (prompt + first_token)
-    accumulated_tokens_mx = mx.array(accumulated_tokens)[None, :]
+    accumulated_tokens_mx = output_ids[:, :start]
     _ = target_model_with_hidden(accumulated_tokens_mx, cache=None)
     target_hidden = extract_context_feature(
         target_model_with_hidden.hidden_states,
         draft_model.target_layer_ids,
     )
 
-    # Decode loop - moved outside stream block
+    # Decode loop
     while ntoks < max_tokens:
         remaining = max_tokens - ntoks
         current_block_size = min(block_size, remaining)
 
         with mx.stream(generation_stream):
+            # Get block of tokens from output_ids (like reference)
+            # These may be mask tokens (first time) or actual tokens (subsequent iterations)
+            block_output_ids = output_ids[:, start : start + current_block_size]
+
             # Create position_ids for the draft model
-            # In the reference, position_ids are GLOBAL positions in the output sequence
-            # The noise tokens start at position len(accumulated_tokens)
-            # The position_ids should cover ALL positions that K will attend to (context + noise)
-            # But the noise tokens are at positions [len(accumulated_tokens), len(accumulated_tokens) + block_size)
-            # And the context is at positions [0, len(accumulated_tokens))
-
-            # The key insight: position_ids should start from 0 and cover all positions
-            # But the noise tokens' GLOBAL position is len(accumulated_tokens)
-            # So we need position_ids = [0, 1, ..., len(accumulated_tokens) + block_size - 1]
-
-            # Actually, looking at the reference more carefully:
-            # position_ids = position_ids[:, start:start + block_size] where start = len(output_ids) in global sequence
-            # This gives position_ids for the noise tokens at their global positions
-
-            # But the draft model also needs position embeddings for the context tokens (in K)
-            # So we need position_ids for ALL positions: [0, len(accumulated_tokens) + block_size)
-
-            global_pos = len(accumulated_tokens)
-            total_positions = global_pos + current_block_size
+            # We need position_ids for ALL positions for RoPE to work correctly
+            total_positions = start + current_block_size
             position_ids = mx.arange(0, total_positions)[None, :]
 
-            # Create mask token embeddings
-            block_ids = mx.full([current_block_size], mask_token_id, dtype=mx.uint32)
-            noise_embedding = target_inner.embed_tokens(block_ids)[None, ...]
+            # Create embeddings from ACTUAL tokens (not just mask tokens)
+            # This is the key fix - we use the actual tokens from output_ids
+            noise_embedding = target_inner.embed_tokens(block_output_ids)
 
             # Draft model generates (reusing cache like reference)
             draft_output = draft_model(
@@ -267,7 +262,9 @@ def block_diffusion_generate_step(
 
             # For verification, we need: [first_token, draft_token_0, draft_token_1, ...]
             # The target model will predict next tokens for each position
-            draft_tokens_for_target = mx.concatenate([mx.array([first_token]), draft_tokens_block])
+            # first_token is the last token in output_ids before the current block
+            first_token = output_ids[:, start - 1]
+            draft_tokens_for_target = mx.concatenate([first_token, draft_tokens_block])
 
             # Convert draft_logits to logprobs for yielding
             draft_logprobs = draft_logits - mx.logsumexp(draft_logits, axis=-1, keepdims=True)
@@ -290,10 +287,13 @@ def block_diffusion_generate_step(
             ).sum()
             acceptance_length = int(acceptance_length)
 
-            # Trim caches
-            num_rejected = current_block_size - 1 - acceptance_length
-            if num_rejected > 0:
-                trim_prompt_cache(model_cache, num_rejected)
+            # Update output_ids with accepted draft tokens (like reference)
+            # block_output_ids[0] is the seed token
+            # block_output_ids[1..acceptance_length] are the accepted draft tokens
+            output_ids[:, start + 1 : start + acceptance_length + 1] = draft_tokens_block[:acceptance_length]
+
+            # Update output_ids with the target token
+            output_ids[:, start + acceptance_length + 1] = target_tokens_sampled[acceptance_length]
 
             # Yield accepted draft tokens
             for i in range(acceptance_length):
@@ -314,20 +314,13 @@ def block_diffusion_generate_step(
             if ntoks >= max_tokens:
                 break
 
-            # Update first_token for next iteration
-            first_token = target_token
-
-            # Accumulate all generated tokens and update target_hidden incrementally
-            # Add accepted draft tokens
-            for i in range(acceptance_length):
-                accumulated_tokens.append(draft_tokens_block[i].item())
-            # Add the target token
-            accumulated_tokens.append(target_token.item())
+            # Move start position forward (like reference)
+            start += acceptance_length + 1
 
             # Update target_hidden with new tokens
             # Reference: target_hidden = extract_context_feature(...)[:, :acceptance_length + 1, :]
-            # This includes seed token (position 0) + accepted drafts (positions 1..acceptance_length)
-            # Does NOT include the target token at position acceptance_length+1
+            # This REPLACES target_hidden with seed + accepted drafts
+            # (The cache provides the rest of the context)
 
             new_hidden_states = []
             for layer_id in draft_model.target_layer_ids:
@@ -337,7 +330,6 @@ def block_diffusion_generate_step(
                 new_hidden = layer_hidden[:, :acceptance_length + 1, :]
                 new_hidden_states.append(new_hidden)
 
-            # Append new context to target_hidden
+            # Replace target_hidden (not append!)
             if new_hidden_states and new_hidden_states[0].shape[1] > 0:
-                new_target_hidden = mx.concatenate(new_hidden_states, axis=-1)
-                target_hidden = mx.concatenate([target_hidden, new_target_hidden], axis=1)
+                target_hidden = mx.concatenate(new_hidden_states, axis=-1)
