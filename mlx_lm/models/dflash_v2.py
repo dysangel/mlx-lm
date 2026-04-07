@@ -143,7 +143,6 @@ class DFlashAttention(nn.Module):
     def __call__(
         self,
         hidden_states: mx.array,
-        target_hidden: mx.array,
         position_embeddings: Tuple[mx.array, mx.array],
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
@@ -289,7 +288,6 @@ class DFlashDecoderLayer(nn.Module):
     def __call__(
         self,
         hidden_states: mx.array,
-        target_hidden: mx.array,
         position_embeddings: Tuple[mx.array, mx.array],
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
@@ -397,35 +395,41 @@ class Model(nn.Module):
         # No reshaping needed - from_dict now detects actual dimensions from weights
         return weights
 
+    def project_target_hidden(self, target_hidden: mx.array) -> mx.array:
+        """Project concatenated target-layer hidden states into draft hidden_size.
+
+        Args:
+            target_hidden: [B, ctx_len, num_layers * D] - raw target features
+
+        Returns:
+            Compressed hidden states [B, ctx_len, D]
+        """
+        B, ctx_len, num_layers_times_D = target_hidden.shape
+        target_hidden_flat = target_hidden.reshape(B * ctx_len, num_layers_times_D)
+        compressed_target_flat = self.hidden_norm(self.fc(target_hidden_flat))
+        return compressed_target_flat.reshape(B, ctx_len, -1)
+
     def __call__(
         self,
         position_ids: mx.array,
         noise_embedding: mx.array,
-        target_hidden: mx.array,
         cache: Optional[Any] = None,
     ) -> mx.array:
         """
         Args:
             position_ids: [B, L] - absolute positions for noise tokens
             noise_embedding: [B, L, D] - embeddings from mask tokens
-            target_hidden: [B, ctx_len, num_layers * D] - raw target features
-            cache: KV caches
+            cache: KV caches (should already contain materialized target context)
 
         Returns:
             Hidden states [B, L, D]
         """
-        # Compress target context features
-        B, ctx_len, num_layers_times_D = target_hidden.shape
-        target_hidden_flat = target_hidden.reshape(B * ctx_len, num_layers_times_D)
-        compressed_target_flat = self.hidden_norm(self.fc(target_hidden_flat))
-        target_hidden = compressed_target_flat.reshape(B, ctx_len, -1)
-
         # Compute position embeddings
         position_embeddings = self.rotary_emb(noise_embedding, position_ids)
 
         # Process through decoder layers
         hidden_states = noise_embedding
         for layer, c in zip(self.layers, cache or [None] * len(self.layers)):
-            hidden_states = layer(hidden_states, target_hidden, position_embeddings, mask=None, cache=c)
+            hidden_states = layer(hidden_states, position_embeddings, cache=c)
 
         return self.norm(hidden_states)
