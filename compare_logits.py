@@ -33,8 +33,8 @@ target_output_mlx = target_with_hidden(input_ids_mlx[None], cache=None)
 
 hidden_states = target_with_hidden.hidden_states
 selected_states = []
-for i, layer_id in enumerate(draft_mlx.target_layer_ids):
-    selected_states.append(hidden_states[i + 1])
+for layer_id in draft_mlx.target_layer_ids:
+    selected_states.append(hidden_states[layer_id + 1])  # +1 for embedding offset
 target_hidden_mlx_raw = mx.concatenate(selected_states, axis=-1)
 
 noise_ids_ref = torch.tensor([[mask_token_id] * (block_size - 1)])

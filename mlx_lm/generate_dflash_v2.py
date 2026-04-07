@@ -32,17 +32,17 @@ def extract_context_feature(
     """Extract and concatenate hidden states from specified target model layers.
 
     Args:
-        hidden_states: List of hidden states from ModelWithHiddenStates
-                       [0] = embedding, [1:] = captured layer outputs in order
+        hidden_states: ALL hidden states from target model
+                       [0] = embedding, [1:] = all layer outputs
         layer_ids: Target layer IDs (e.g., [1, 8, 15, 22, 29])
 
     Returns:
         Concatenated hidden states [B, seq_len, num_layers * hidden_size]
     """
-    # ModelWithHiddenStates captures: [0]=embedding, then layers in target_layer_ids order
-    # So hidden_states[1] corresponds to layer_ids[0], etc.
-    # Skip the embedding at index 0
-    selected_states = hidden_states[1:]  # All captured layers in order
+    # Use offset=1 to account for the embedding at index 0
+    # hidden_states[layer_id + offset] gives us the output of layer at layer_id
+    offset = 1
+    selected_states = [hidden_states[layer_id + offset] for layer_id in layer_ids]
     return mx.concatenate(selected_states, axis=-1)
 
 
@@ -81,12 +81,11 @@ class ModelWithHiddenStates(nn.Module):
             else:
                 cache = [None] * len(inner_model.layers)
 
-        # Process through layers
+        # Process through layers - capture ALL layer outputs like reference
         mask = None  # Use default causal masking
         for i, (layer, c) in enumerate(zip(inner_model.layers, cache)):
             h = layer(h, mask, c)
-            if i in self.target_layer_ids:
-                self.hidden_states.append(h)
+            self.hidden_states.append(h)  # Capture ALL layers
 
         # Final normalization
         h = inner_model.norm(h)
