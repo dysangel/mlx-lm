@@ -218,6 +218,13 @@ def setup_arg_parser():
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
     )
+    parser.add_argument(
+        "--block-size",
+        type=int,
+        help="Block size for DFlash speculative decoding.",
+        default=None,
+        choices=[4, 8, 16, 32],
+    )
     return parser
 
 
@@ -698,11 +705,29 @@ def stream_generate(
             (token, logprobs, False) for token, logprobs in token_generator
         )
     else:
+        # Check if draft_model is a DFlash model
+        is_dflash = (
+            hasattr(draft_model, "block_size")
+            and hasattr(draft_model, "mask_token_id")
+            and draft_model.mask_token_id is not None
+        )
+
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)
-        token_generator = speculative_generate_step(
-            prompt, model, draft_model, **kwargs
-        )
+
+        if is_dflash:
+            # Use DFlash block diffusion generation (v2 - reference port)
+            from .generate_dflash_v2 import block_diffusion_generate_step
+            # Pop num_draft_tokens since DFlash uses block_size instead
+            kwargs.pop("num_draft_tokens", None)
+            token_generator = block_diffusion_generate_step(
+                prompt, model, draft_model, tokenizer, **kwargs
+            )
+        else:
+            # Use standard speculative decoding
+            token_generator = speculative_generate_step(
+                prompt, model, draft_model, **kwargs
+            )
     with wired_limit(model, [generation_stream]):
         tic = time.perf_counter()
         for n, (token, logprobs, from_draft) in enumerate(token_generator):
@@ -2055,6 +2080,7 @@ def main():
         quantized_kv_start=args.quantized_kv_start,
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
+        block_size=args.block_size,
     )
     if not args.verbose:
         print(response)

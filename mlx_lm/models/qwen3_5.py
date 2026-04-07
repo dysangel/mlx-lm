@@ -358,7 +358,7 @@ class ModelArgs(BaseModelArgs):
     text_config: dict
 
     @classmethod
-    def from_dict(cls, params):
+    def from_dict(cls, params, weights=None):
         if "text_config" not in params:
             return cls(model_type=params["model_type"], text_config=params)
         return super().from_dict(params)

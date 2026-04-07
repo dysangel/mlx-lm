@@ -183,6 +183,20 @@ def _get_classes(config: dict):
         A tuple containing the Model class and the ModelArgs class.
     """
     model_type = config["model_type"]
+
+    # Check if this is a DFlash draft model
+    # The most reliable indicator is the presence of dflash_config
+    is_dflash = "dflash_config" in config
+
+    if is_dflash:
+        # Use DFlash v2 model implementation (reference port)
+        try:
+            arch = importlib.import_module("mlx_lm.models.dflash_v2")
+            return arch.Model, arch.ModelArgs
+        except ImportError:
+            msg = "DFlash model type detected but dflash_v2 module not found."
+            raise ValueError(msg)
+
     model_type = MODEL_REMAPPING.get(model_type, model_type)
     try:
         arch = importlib.import_module(f"mlx_lm.models.{model_type}")
@@ -338,7 +352,7 @@ def load_model(
         if "quantization_config" in text_config:
             config["quantization_config"] = text_config["quantization_config"]
 
-    model_args = model_args_class.from_dict(config)
+    model_args = model_args_class.from_dict(config, weights)
 
     model = model_class(model_args)
 
