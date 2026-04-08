@@ -134,27 +134,37 @@ class SpeculativeArraysCache(_BaseCache):
         This should be called BEFORE running the draft model to save a checkpoint.
         If draft tokens are rejected, call rollback() to restore this state.
         """
+        # Save the committed_up_to position
         self._checkpoint_committed_up_to = self._committed_up_to
+
+        # Save snapshots of cache arrays at checkpoint time
+        self._checkpoint_cache = []
+        for i in range(len(self.cache)):
+            if self.cache[i] is not None:
+                # Create a copy of the cache array at checkpoint
+                self._checkpoint_cache.append(self.cache[i])
+            else:
+                self._checkpoint_cache.append(None)
+
         logger.debug(f"SpeculativeArraysCache: checkpoint saved at position {self._committed_up_to}")
 
     def rollback(self):
         """Rollback cache to last checkpoint, discarding all speculative tokens.
 
-        This is an O(1) operation - we just reset the committed_up_to pointer.
-        The cache arrays are sliced to remove speculative tokens.
-
-        This should be called when draft tokens are rejected by the target model.
+        This restores the cache arrays to the exact state they were in at checkpoint time.
         """
         old_committed = self._committed_up_to
         self._committed_up_to = self._checkpoint_committed_up_to
-        logger.debug(f"SpeculativeArraysCache: rollback from {old_committed} to {self._committed_up_to}")
 
-        # Slice cache arrays to committed position
-        if self.cache[0] is not None and self.cache[0].shape[1] > self._committed_up_to:
-            committed_len = self._committed_up_to
-            for i in range(len(self.cache)):
-                if self.cache[i] is not None and self.cache[i].shape[1] > committed_len:
-                    self.cache[i] = self.cache[i][:, :committed_len, ...]
+        # Restore cache arrays from checkpoint snapshots
+        for i in range(len(self.cache)):
+            if self._checkpoint_cache[i] is not None:
+                # Restore the saved cache array
+                self.cache[i] = self._checkpoint_cache[i]
+            else:
+                self.cache[i] = None
+
+        logger.debug(f"SpeculativeArraysCache: rollback from {old_committed} to {self._committed_up_to}")
 
     def commit(self, up_to: int):
         """Mark tokens up to position as committed.
