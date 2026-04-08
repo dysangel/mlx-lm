@@ -4,6 +4,24 @@
 
 Implementing DFlash (block diffusion speculative decoding) for MLX-LM revealed several key insights about MLX's cache system and the challenges of integrating draft models with target models.
 
+## CRITICAL BUG FOUND (April 2026)
+
+During cache corruption fixes, the draft token sampling logic was accidentally broken:
+
+```python
+# CORRECT (from working commit 2d7f5fa)
+draft_tokens_block = mx.argmax(draft_logits[:, -current_block_size + 1:, :], axis=-1)
+# Takes the LAST (block_size - 1) positions
+
+# WRONG (introduced during cache fixes)
+draft_tokens_block = mx.argmax(draft_logits[:, :, :], axis=-1)  
+# Takes ALL positions - breaks alignment!
+```
+
+This caused acceptance to drop from ~92% to 0%. The fix has been restored in commit 9f0470f.
+
+Implementing DFlash (block diffusion speculative decoding) for MLX-LM revealed several key insights about MLX's cache system and the challenges of integrating draft models with target models.
+
 ## Cache Types in MLX
 
 ### KVCache
