@@ -157,7 +157,7 @@ def block_diffusion_generate_step(
     else:
         prompt_tokens = prompt
 
-    num_input_tokens = len(prompt_tokens)
+    num_input_tokens = prompt_tokens.shape[1] if prompt_tokens.ndim == 2 else len(prompt_tokens)
     if num_input_tokens == 0:
         raise ValueError("Prompt must not be empty")
 
@@ -253,8 +253,8 @@ def block_diffusion_generate_step(
 
                 # Use draft cache (now re-materialized with correct context)
                 # Position IDs should be ABSOLUTE positions in the full sequence
-                # ctx_len is the length of target_hidden (prompt + all accepted tokens)
-                noise_position_ids = mx.arange(ctx_len, ctx_len + current_block_size)[None, :]
+                # Use `start` (current position in output_ids) not ctx_len
+                noise_position_ids = mx.arange(start, start + current_block_size)[None, :]
 
                 # Call draft model with target_hidden
                 draft_output = draft_model(
