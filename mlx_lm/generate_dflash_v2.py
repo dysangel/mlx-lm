@@ -190,16 +190,18 @@ def block_diffusion_generate_step(
     # === PREFILL ===
     prompt_tokens = prompt_tokens[None, :]
     prefill_output = target_model_with_hidden(prompt_tokens, cache=target_cache)
-    mx.eval(prefill_output.logits)
-
-    # Sample first token and place it in output_ids
-    first_token = mx.argmax(prefill_output.logits[:, -1, :], axis=-1).squeeze(0)
 
     # Extract target_hidden from prefill — all prompt token hidden states
     target_hidden = extract_context_feature(
         prefill_output.hidden_states, draft_model.target_layer_ids
     )
-    mx.eval(target_hidden)
+
+    # Batch eval: logits + hidden states together
+    mx.eval(prefill_output.logits, target_hidden)
+    mx.clear_cache()
+
+    # Sample first token and place it in output_ids
+    first_token = mx.argmax(prefill_output.logits[:, -1, :], axis=-1).squeeze(0)
 
     # Initialize output_ids buffer (matching reference layout)
     max_length = num_input_tokens + max_tokens + block_size
@@ -212,6 +214,7 @@ def block_diffusion_generate_step(
     ntoks = 1
 
     start = num_input_tokens  # Start at first generated token position
+    lm_head = get_lm_head(model)
 
     # === DECODE LOOP ===
     while start < num_input_tokens + max_tokens and ntoks < max_tokens:
@@ -241,16 +244,16 @@ def block_diffusion_generate_step(
             cache=draft_cache,
         )
         # Only take the last current_block_size-1 positions (skip prev_token)
-        lm_head = get_lm_head(model)
         draft_logits = lm_head(
             draft_output[:, -current_block_size + 1:, :]
         )
-        mx.eval(draft_logits)
+        mx.async_eval(draft_logits)
 
-        # Crop draft cache to start (discard speculative K/V beyond verified position)
+        # Crop draft cache to start while draft logits compute asynchronously
         _crop_cache(draft_cache, start)
 
-        # Sample draft tokens (replace mask tokens with predictions)
+        # Wait for draft logits, then sample
+        mx.eval(draft_logits)
         block_output_ids[:, 1:] = mx.argmax(draft_logits, axis=-1)
 
         # === VERIFY PHASE ===
@@ -295,7 +298,7 @@ def block_diffusion_generate_step(
         target_hidden = extract_context_feature(
             verify_output.hidden_states, draft_model.target_layer_ids
         )[:, :acceptance_length + 1, :]
-        mx.eval(target_hidden)
+        mx.eval(target_hidden, bonus_token)
 
         # Place accepted tokens + bonus in output buffer
         output_ids[:, start: start + acceptance_length + 1] = block_output_ids[:, :acceptance_length + 1]
