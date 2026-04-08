@@ -213,6 +213,11 @@ def setup_arg_parser():
         default=None,
     )
     parser.add_argument(
+        "--quantize-draft",
+        action="store_true",
+        help="Quantize the draft model to 4-bit for faster inference.",
+    )
+    parser.add_argument(
         "--num-draft-tokens",
         type=int,
         help="Number of tokens to draft when using speculative decoding.",
@@ -2060,6 +2065,9 @@ def main():
         is_dflash = args.block_size is not None and hasattr(draft_model, 'block_size')
         if not is_dflash and draft_tokenizer.vocab_size != tokenizer.vocab_size:
             raise ValueError("Draft model tokenizer does not match model tokenizer.")
+        if args.quantize_draft:
+            import mlx.nn as nn
+            nn.quantize(draft_model, group_size=64, bits=4)
     else:
         draft_model = None
     sampler = make_sampler(

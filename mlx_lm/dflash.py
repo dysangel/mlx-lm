@@ -38,6 +38,11 @@ def setup_arg_parser():
     parser.add_argument("--seed", type=int, default=None, help="Random seed.")
     parser.add_argument("--block-size", type=int, default=None, help="Override block size.")
     parser.add_argument(
+        "--quantize-draft",
+        action="store_true",
+        help="Quantize the draft model to 4-bit for faster inference.",
+    )
+    parser.add_argument(
         "--verbose", action="store_true", help="Print per-iteration stats."
     )
     return parser
@@ -54,6 +59,11 @@ def main():
     target_model, tokenizer = load(args.target)
     print(f"Loading draft model: {args.draft}", file=sys.stderr)
     draft_model, _ = load(args.draft)
+
+    if args.quantize_draft:
+        import mlx.nn as nn
+        nn.quantize(draft_model, group_size=64, bits=4)
+        print("Quantized draft model to 4-bit", file=sys.stderr)
 
     if args.block_size is not None:
         draft_model.block_size = args.block_size

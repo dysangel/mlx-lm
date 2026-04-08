@@ -8,17 +8,16 @@ HOST="0.0.0.0"
 PORT=11111
 MAX_TOKENS=16384
 
-
 echo "Starting DFlash 27B Server..."
 echo "Target Model: $MODEL"
 echo "Draft Model: $DRAFT_MODEL"
-echo "Block Size: $BLOCK_SIZE"
 echo "Max Tokens: $MAX_TOKENS"
 echo "Host: $HOST:$PORT"
 
 python -m mlx_lm.server \
   --model "$MODEL" \
   --draft-model "$DRAFT_MODEL" \
+  --quantize-draft \
   --host "$HOST" \
   --port $PORT \
   --max-tokens $MAX_TOKENS \
