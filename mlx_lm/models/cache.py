@@ -596,12 +596,35 @@ class ArraysCache(_BaseCache):
         instance = super().__new__(cls)
         instance.left_padding = None
         instance.lengths = None
+        instance._offset = 0
         return instance
 
     def __init__(self, size, left_padding: Optional[List[int]] = None):
         self.cache = [None] * size
         if left_padding:
             self.left_padding = mx.array(left_padding)
+
+    @property
+    def offset(self):
+        """Get current offset based on actual array size."""
+        if self.cache[0] is not None:
+            return self.cache[0].shape[1] if len(self.cache[0].shape) >= 2 else 0
+        return 0
+
+    @offset.setter
+    def offset(self, value):
+        """Set offset manually (for testing or special cases)."""
+        self._offset = value
+
+    def __getitem__(self, idx):
+        """Return cache entry, respecting offset for sequence arrays."""
+        arr = self.cache[idx]
+        # If this is a sequence array (has rank >= 2), slice by offset
+        if arr is not None:
+            shape = arr.shape
+            if len(shape) >= 2:  # Sequence dimension is axis 1
+                return arr[:, :self.offset, ...]
+        return arr
 
     def __setitem__(self, idx, value):
         self.cache[idx] = value
@@ -637,7 +660,13 @@ class ArraysCache(_BaseCache):
                 return a
             return mx.concatenate([a, b])
 
+        old_offset = self.offset
         self.cache = [cat(c, o) for c, o in zip(self.cache, other.cache)]
+        # Update offset to track the new total length
+        if self.cache[0] is not None:
+            self.offset = self.cache[0].shape[1]
+        else:
+            self.offset = old_offset
 
     def extract(self, idx):
         cache = ArraysCache(len(self.cache))
@@ -650,6 +679,26 @@ class ArraysCache(_BaseCache):
     def finalize(self):
         self.lengths = None
         self.left_padding = None
+
+    def size(self):
+        """Return the current valid size based on actual arrays."""
+        return self.offset
+
+    def trim(self, n: int) -> int:
+        """Trim n tokens by slicing arrays."""
+        if self.cache[0] is None:
+            return 0
+        current_len = self.cache[0].shape[1] if len(self.cache[0].shape) >= 2 else 0
+        n = min(n, current_len)
+        keep_len = current_len - n
+        if keep_len > 0:
+            for i in range(len(self.cache)):
+                if self.cache[i] is not None:
+                    self.cache[i] = self.cache[i][:, :keep_len, ...]
+        return n
+
+    def is_trimmable(self):
+        return True
 
     def advance(self, N):
         if self.lengths is not None:
