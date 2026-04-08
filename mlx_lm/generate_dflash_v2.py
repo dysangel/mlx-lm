@@ -269,24 +269,13 @@ def block_diffusion_generate_step(
 
                 # Use draft cache (now re-materialized with correct context)
                 cache_size = draft_cache.total_size()
-
-                # Get target position for comparison
-                target_position = None
-                for c in target_cache:
-                    if hasattr(c, 'offset'):
-                        target_position = c.offset
-                        break
-
                 noise_position_ids = mx.arange(cache_size, cache_size + current_block_size)[None, :]
 
-                # Debug: check position IDs
-                if iteration <= 3:
-                    logger.debug(f"noise_position_ids: {noise_position_ids.tolist()}")
-                    logger.debug(f"cache_size (draft): {cache_size}, target_offset: {target_position}")
-
+                # Call draft model with target_hidden
                 draft_output = draft_model(
                     position_ids=noise_position_ids,
                     noise_embedding=noise_embedding,
+                    target_hidden=target_hidden,
                     cache=draft_cache,
                 )
                 mx.eval(draft_output)
@@ -298,144 +287,97 @@ def block_diffusion_generate_step(
                     draft_logits = target_inner.embed_tokens.as_linear(draft_output)
                 mx.eval(draft_logits)
 
-                # Sample draft tokens
-                if draft_logits.shape[1] > 0:
-                    draft_tokens_block = mx.argmax(draft_logits[:, :, :], axis=-1).squeeze(0)
+                # Sample draft tokens (skip first position which is for the seed token)
+                if draft_logits.shape[1] > current_block_size - 1:
+                    draft_tokens_block = mx.argmax(draft_logits[:, -current_block_size + 1:, :], axis=-1).squeeze(0)
                 else:
                     draft_tokens_block = mx.array([], dtype=mx.uint32)
 
-                # Debug: check first draft token
-                if draft_logits.shape[1] > 0:
-                    first_draft_token = mx.argmax(draft_logits[:, 0, :]).item()
-                    logger.debug(f"First draft token from logit[0]: {first_draft_token}")
-
                 logger.debug(f"Draft tokens (first 5): {draft_tokens_block[:5].tolist() if draft_tokens_block.size > 0 else []}")
+
+                # Construct draft tokens for verification (prepend first_token as seed)
+                draft_tokens = mx.concatenate([mx.array([last_token_id]), draft_tokens_block])
 
                 # Verify draft tokens
                 acceptance_length = 0
                 if draft_tokens_block.size > 0:
                     # Save ArraysCache conv_state before running draft tokens
-                    # conv_state is a rolling window that gets overwritten - must save/restore
                     arrays_cache_state = []
                     for i, c in enumerate(target_cache):
-                        if hasattr(c, 'cache') and c.cache[0] is not None:  # ArraysCache with data
+                        if hasattr(c, 'cache') and c.cache[0] is not None:
                             arrays_cache_state.append((i, c.cache[0], c.cache[1]))
 
-                    # Run draft tokens through target model WITH cache
-                    # The model will write at the correct offset automatically
-                    target_verify_input = draft_tokens_block[None, :]
-
-                    # Debug: check cache state before
-                    arraycache_size_before = None
-                    for c in target_cache:
-                        if hasattr(c, 'cache') and c.cache[0] is not None:
-                            arraycache_size_before = c.cache[0].shape[1]
-                            break
-
-                    logger.debug(f"ArraysCache size before verify: {arraycache_size_before}")
-
-                    logits = model(target_verify_input, cache=target_cache)
+                    # Verify draft_to_verify (skip seed token)
+                    draft_to_verify = draft_tokens[1:][None, :]
+                    logits = model(draft_to_verify, cache=target_cache)
                     mx.eval(logits)
 
-                    # Check cache state after
-                    arraycache_size_after = None
-                    for c in target_cache:
-                        if hasattr(c, 'cache') and c.cache[0] is not None:
-                            arraycache_size_after = c.cache[0].shape[1]
+                    # Get target predictions
+                    target_tokens = mx.argmax(logits, axis=-1).squeeze(0)
+
+                    # Find acceptance length (compare with target_values)
+                    # target_tokens has one fewer element (no prediction for last token)
+                    acceptance_length = (
+                        mx.cumsum(draft_to_verify.squeeze(0) == target_tokens) == mx.arange(len(target_tokens))
+                    ).sum()
+                    acceptance_length = int(acceptance_length)
+
+                    logger.debug(f"Acceptance: {acceptance_length}/{len(draft_tokens_block)}")
+
+                    # Rollback cache for rejected tokens
+                    if acceptance_length < len(draft_tokens_block):
+                        num_rejected = len(draft_tokens_block) - acceptance_length
+
+                        # Trim KVCache layers
+                        for c in target_cache:
+                            if hasattr(c, 'trim') and not hasattr(c, 'cache'):
+                                c.trim(num_rejected)
+
+                        # Restore ArraysCache conv_state from saved references
+                        for idx, saved_k, saved_v in arrays_cache_state:
+                            target_cache[idx].cache[0] = saved_k
+                            target_cache[idx].cache[1] = saved_v
+
+                        logger.debug(f"Trimmed {num_rejected} tokens, acceptance: {acceptance_length}")
+
+                    # Yield accepted draft tokens
+                    for i in range(acceptance_length):
+                        yield draft_tokens[i + 1].item(), draft_logits[:, i, :], True
+                        ntoks += 1
+                        if ntoks >= max_tokens:
                             break
 
-                    logger.debug(f"ArraysCache size after verify: {arraycache_size_after}")
+                    if ntoks >= max_tokens:
+                        break
 
-                    # Get target predictions and check acceptance
-                    if logits.ndim == 3 and logits.shape[1] >= draft_tokens_block.size:
-                        target_tokens = mx.argmax(logits[:, :draft_tokens_block.size, :], axis=-1).squeeze(0)
+                    # Yield accepted draft tokens
+                    for i in range(acceptance_length):
+                        yield draft_tokens[i + 1].item(), draft_logits[:, i, :], True
+                        ntoks += 1
+                        if ntoks >= max_tokens:
+                            break
 
-                        # Debug: check first few tokens in detail
-                        logger.debug(f"Draft[0]={draft_tokens_block[0].item()}, Target[0]={target_tokens[0].item()}, Match={draft_tokens_block[0].item() == target_tokens[0].item()}")
-                        if draft_tokens_block.size > 1:
-                            logger.debug(f"Draft[1]={draft_tokens_block[1].item()}, Target[1]={target_tokens[1].item()}, Match={draft_tokens_block[1].item() == target_tokens[1].item()}")
+                    if ntoks >= max_tokens:
+                        break
 
-                        # Check acceptance
-                        for i in range(min(len(draft_tokens_block), len(target_tokens))):
-                            if draft_tokens_block[i].item() == target_tokens[i].item():
-                                acceptance_length += 1
-                            else:
-                                break
+                    # Yield one target token (from verification step)
+                    target_token = mx.argmax(logits[:, -1, :], axis=-1).squeeze(0)
+                    yield target_token.item(), logits[:, -1, :], False
+                    ntoks += 1
 
-                        logger.debug(f"Draft (first 5): {draft_tokens_block[:5].tolist()}")
-                        logger.debug(f"Target (first 5): {target_tokens[:5].tolist()}")
-                        logger.debug(f"Acceptance: {acceptance_length}/{len(draft_tokens_block)}")
+                    # Accumulate the target token for next iteration
+                    accumulated_tokens.append(target_token.item())
 
-                        # Rollback cache for rejected tokens
-                        if acceptance_length < len(draft_tokens_block):
-                            num_rejected = len(draft_tokens_block) - acceptance_length
+                    # Rebuild target_hidden with the new token
+                    accumulated_tokens_mx = mx.array(accumulated_tokens)[None, :]
+                    _ = target_model_with_hidden(accumulated_tokens_mx, cache=None)
+                    target_hidden = extract_context_feature(
+                        target_model_with_hidden.hidden_states,
+                        draft_model.target_layer_ids,
+                    )
 
-                            # Trim KVCache layers
-                            for c in target_cache:
-                                if hasattr(c, 'trim') and not hasattr(c, 'cache'):
-                                    c.trim(num_rejected)
-
-                            # Restore ArraysCache conv_state from saved references
-                            # Model creates new arrays with mx.contiguous(), so old refs are safe to restore
-                            for idx, saved_k, saved_v in arrays_cache_state:
-                                target_cache[idx].cache[0] = saved_k
-                                target_cache[idx].cache[1] = saved_v
-
-                            logger.debug(f"Trimmed KVCache and restored {len(arrays_cache_state)} ArraysCache layers")
-
-            # Use target model directly (via wrapper to keep hidden_states updated)
-            last_token_id = output_ids[:, start - 1].item()
-            token_input = mx.array([[last_token_id]])
-            output = target_model_with_hidden(token_input, cache=target_cache)
-            token = sampler(output.logits[0, -1:, :])[0].item()
-            logits = output.logits
-
-            # Accumulate hidden states (only for accepted target tokens, not draft verification)
-            for i, h in enumerate(target_model_with_hidden.hidden_states):
-                if i < len(accumulated_hidden):
-                    accumulated_hidden[i] = mx.concatenate([accumulated_hidden[i], h], axis=1)
-                else:
-                    accumulated_hidden.append(h)
-
-            # Regenerate draft cache with ACCUMULATED target hidden states
-            current_target_hidden = extract_context_feature(
-                accumulated_hidden,
-                draft_model.target_layer_ids,
-            )
-
-            # Get current context length from accumulated_hidden
-            ctx_len = current_target_hidden.shape[1]
-            ctx_position_ids = mx.arange(ctx_len)[None, :]
-
-            # Reset draft cache and re-materialize
-            draft_cache = draft_model.make_cache()
-            draft_model.materialize_target_hidden(current_target_hidden, draft_cache, ctx_position_ids)
-            draft_cache.update_noise_start(ctx_len)
-
-            if iteration <= 3:
-                target_offset = next((c.offset for c in target_cache if hasattr(c, 'offset')), None)
-                logger.debug(f"Re-materialize: accumulated_hidden.shape={current_target_hidden.shape}, target_cache.offset={target_offset}")
-
-            # Check first cache layer keys shape (always)
-            first_cache = draft_cache.caches[0]
-            if first_cache.keys is not None:
-                if iteration <= 3:
-                    logger.debug(f"First draft cache keys.shape: {first_cache.keys.shape}")
-            else:
-                logger.debug(f"ERROR: First draft cache keys is None after materialization!")
-
-            if iteration <= 3:
-                logger.debug(f"Re-materialized draft cache with ctx_len={ctx_len}, hidden.shape={current_target_hidden.shape}")
-                logger.debug(f"Draft cache size after materialization: {draft_cache.total_size()}")
-
-        # Update output_ids
-        output_ids[:, start] = token
-
-        # Yield token
-        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        logger.debug(f"Yielding token: {token}")
-        yield token, logprobs[:, -1, :].squeeze(0), False
-        ntoks += 1
+                    if ntoks >= max_tokens:
+                        break
 
         # Clear cache periodically
         if ntoks % 256 == 0:
