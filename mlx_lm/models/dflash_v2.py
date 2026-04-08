@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from .cache import KVCache
+from .dflash_cache import CroppableKVCache, DFlashCacheManager
 from .base import scaled_dot_product_attention
 from .activations import swiglu
 
@@ -140,6 +140,79 @@ class DFlashAttention(nn.Module):
         self.q_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.k_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
 
+    def kv_proj_only(self, hidden_states: mx.array) -> tuple[mx.array, mx.array]:
+        """Project hidden_states to K/V only (skip Q).
+
+        Used by DFlash to materialize ctx tokens into the draft KV cache.
+
+        Args:
+            hidden_states: [B, L, D] - Input hidden states
+
+        Returns:
+            (k, v) - K/V projections [n_kv_heads, B, L, head_dim] each
+        """
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
+
+        # Reshape and transpose for multi-head attention (like in __call__)
+        B, L = k.shape[:2]
+        k = k.reshape(B, L, self.num_key_value_heads, -1).transpose(0, 2, 1, 3)
+        v = v.reshape(B, L, self.num_key_value_heads, -1).transpose(0, 2, 1, 3)
+        return k, v
+
+    def apply_k_norm(self, k: mx.array) -> mx.array:
+        """Apply K RMS norm without Q dependency.
+
+        Args:
+            k: [n_kv_heads, B, L, head_dim] - Key projections
+
+        Returns:
+            Normalized k in same shape
+        """
+        original_shape = k.shape
+        k_by_head = k.reshape(-1, self.head_dim)
+        k_by_head = self.k_norm(k_by_head)
+        return k_by_head.reshape(original_shape)
+
+    def apply_k_rope(self, positions: mx.array, k: mx.array, rotary_emb: nn.Module) -> mx.array:
+        """Apply RoPE to K using the model's RoPE module.
+
+        Args:
+            positions: [B, L] - Position indices
+            k: [n_kv_heads, B, L, head_dim] - Key projections
+            rotary_emb: The RoPE module from the model
+
+        Returns:
+            RoPE-applied k in same shape
+        """
+        n_kv_heads, B, L, head_dim = k.shape
+
+        # Create dummy query to get cos/sin from RoPE module
+        dummy_q = mx.zeros((B, L, 1, head_dim), k.dtype)
+
+        # Use the actual RoPE module to compute cos/sin
+        cos, sin = rotary_emb(dummy_q, positions)
+
+        # Expand cos/sin for broadcasting with k
+        # cos, sin have shape (L, head_dim/2), need to duplicate and expand
+        cos = mx.concatenate([cos, cos], axis=-1)  # (L, head_dim)
+        sin = mx.concatenate([sin, sin], axis=-1)  # (L, head_dim)
+
+        # Expand dims for broadcasting: (L, head_dim) -> (1, L, 1, head_dim)
+        cos = mx.expand_dims(cos, 0)  # (1, L, head_dim)
+        cos = mx.expand_dims(cos, 2)  # (1, L, 1, head_dim)
+        sin = mx.expand_dims(sin, 0)  # (1, L, head_dim)
+        sin = mx.expand_dims(sin, 2)  # (1, L, 1, head_dim)
+
+        # Transpose k to [B, L, n_kv_heads, head_dim] for RoPE application
+        k_for_rope = k.transpose(1, 2, 0, 3)
+
+        # Apply RoPE to K
+        k_rot = (k_for_rope * cos) + (rotate_half(k_for_rope) * sin)
+
+        # Transpose back to [n_kv_heads, B, L, head_dim]
+        return k_rot.transpose(2, 0, 1, 3)
+
     def __call__(
         self,
         hidden_states: mx.array,
@@ -147,120 +220,45 @@ class DFlashAttention(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
-        """
+        """Simple standard attention - cache contains materialized context.
+
         Args:
-            hidden_states: Noise embeddings [B, L, D]
-            target_hidden: Compressed context features [B, ctx_len, D]
-            position_embeddings: (cos, sin) for RoPE - computed for ALL positions
-            mask: Attention mask
-            cache: KV cache
+            hidden_states: Input embeddings [B, L, D]
+            position_embeddings: (cos, sin) for RoPE
+            mask: Attention mask (unused, kept for API compatibility)
+            cache: KV cache (contains materialized target context + previous tokens)
+
+        Returns:
+            Output embeddings [B, L, D]
         """
         B, L, D = hidden_states.shape
-        ctx_len = target_hidden.shape[1]
 
-        # Q from noise only
-        queries = self.q_proj(hidden_states)
-        queries = queries.reshape(B, L, self.num_heads, -1)
-        queries = self.q_norm(queries).transpose(0, 2, 1, 3)
+        # Standard QKV projections
+        q = self.q_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
 
-        # K/V from concatenated context + noise
-        k_ctx = self.k_proj(target_hidden)
-        k_noise = self.k_proj(hidden_states)
-        v_ctx = self.v_proj(target_hidden)
-        v_noise = self.v_proj(hidden_states)
+        # Reshape for multi-head attention
+        q = q.reshape(B, L, self.num_heads, -1).transpose(0, 2, 1, 3)
+        k = k.reshape(B, L, self.num_key_value_heads, -1).transpose(0, 2, 1, 3)
+        v = v.reshape(B, L, self.num_key_value_heads, -1).transpose(0, 2, 1, 3)
 
-        # Concatenate and reshape
-        k = mx.concatenate([k_ctx, k_noise], axis=1)
-        v = mx.concatenate([v_ctx, v_noise], axis=1)
-        k = k.reshape(B, ctx_len + L, self.num_key_value_heads, -1)
-        v = v.reshape(B, ctx_len + L, self.num_key_value_heads, -1)
-        k = self.k_norm(k).transpose(0, 2, 1, 3)
-        v = v.transpose(0, 2, 1, 3)
+        # Q/K normalization
+        q = self.q_norm(q)
+        k = self.k_norm(k)
 
         # Apply RoPE
-        # Q (noise tokens) should get RoPE for positions [global_pos, global_pos+L)
-        # K is [context, noise] where context has length ctx_len
-        # K positions [0, ctx_len) are context keys (should get RoPE for [0, ctx_len))
-        # K positions [ctx_len, ctx_len+L) are noise keys (should get RoPE for [global_pos, global_pos+L))
-
-        # We need to know the global position of the noise tokens
-        # This is NOT ctx_len, but rather the position in the global sequence
-        # We can infer this from the fact that noise tokens come after all accumulated tokens
-        # So the global position is ctx_len (number of accumulated tokens)
-
-        # Actually, we need to pass the global position offset to this function
-        # For now, we can infer it: the noise tokens start at position ctx_len in the global sequence
-        # because the context (target_hidden) has length ctx_len
-
-        # Wait, that's not right either. Let me think again...
-        # target_hidden contains hidden states for accumulated_tokens
-        # So ctx_len = len(accumulated_tokens) = global position of next token
-
-        # Therefore, noise tokens should get RoPE for positions [ctx_len, ctx_len+L)
-
         cos, sin = position_embeddings
-        # Expand cos/sin for broadcasting
-        cos = mx.expand_dims(cos, 0)
-        cos = mx.expand_dims(cos, 0)
-        sin = mx.expand_dims(sin, 0)
-        sin = mx.expand_dims(sin, 0)
-        # Concatenate cos/sin with themselves to match head_dim
-        cos = mx.concatenate([cos, cos], axis=-1)
-        sin = mx.concatenate([sin, sin], axis=-1)
+        q_embed, k_embed = apply_rotary_pos_emb(q, k, cos, sin)
 
-        # Q gets RoPE for the LAST L positions (which are the noise token positions)
-        cos_q = cos[..., -L:, :]
-        sin_q = sin[..., -L:, :]
-
-        # K is [context, noise] where:
-        # - K[0:ctx_len] are context keys (should get RoPE for [0, ctx_len))
-        # - K[ctx_len:ctx_len+L] are noise keys (should get RoPE for [ctx_len, ctx_len+L))
-
-        # So context keys get cos[..., :ctx_len, :]
-        # And noise keys get cos[..., ctx_len:ctx_len+L, :]
-        # But we need to be careful about the slicing
-
-        # Context keys get RoPE for positions [0, ctx_len)
-        cos_k_context = cos[..., :ctx_len, :]
-        sin_k_context = sin[..., :ctx_len, :]
-
-        # Noise keys get RoPE for positions [ctx_len, ctx_len+L)
-        # But we need to slice cos correctly
-        # cos has shape [1, 1, total_positions, head_dim]
-        # We need positions [ctx_len, ctx_len+L)
-        cos_k_noise = cos[..., ctx_len:ctx_len + L, :]
-        sin_k_noise = sin[..., ctx_len:ctx_len + L, :]
-
-        # Concatenate context and noise RoPE
-        cos_k = mx.concatenate([cos_k_context, cos_k_noise], axis=-2)
-        sin_k = mx.concatenate([sin_k_context, sin_k_noise], axis=-2)
-
-        q_embed = (queries * cos_q) + (rotate_half(queries) * sin_q)
-        k_embed = (k * cos_k) + (rotate_half(k) * sin_k)
-
-        # Update cache with ONLY noise tokens (not context)
-        # The context (from target_hidden) changes each iteration and shouldn't be cached
-        # Only cache the noise tokens which provide persistent context
+        # Update cache (CroppableKVCache or standard)
         if cache is not None:
-            # Split k_embed and v into context and noise parts
-            # k_embed and v have shape [B, n_heads, ctx_len + L, head_dim]
-            # Context is [:, :, :ctx_len, :], noise is [:, :, ctx_len:, :]
-
-            k_noise = k_embed[:, :, ctx_len:, :]
-            v_noise = v[:, :, ctx_len:, :]
-
-            # Cache only noise tokens
-            k_cached, v_cached = cache.update_and_fetch(k_noise, v_noise)
-
-            # For attention, we need K = [context, cached_noise]
-            # But the cache returns ALL cached noise, not just current iteration
-            # So K = [context_keys, all_cached_noise_keys]
-            k_embed = mx.concatenate([k_embed[:, :, :ctx_len, :], k_cached], axis=2)
-            v = mx.concatenate([v[:, :, :ctx_len, :], v_cached], axis=2)
+            k_embed, v = cache.update_and_fetch(k_embed, v)
 
         # Scaled dot-product attention
+        # mask=None provides non-causal attention (attend to all positions including cache)
         output = scaled_dot_product_attention(
-            q_embed, k_embed, v, cache=None, scale=self.scaling, mask=mask
+            q_embed, k_embed, v, cache=None, scale=self.scaling, mask=None
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
@@ -280,6 +278,7 @@ class MLP(nn.Module):
 class DFlashDecoderLayer(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
+        self.layer_idx = layer_idx
         self.self_attn = DFlashAttention(args)
         self.mlp = MLP(args)
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
@@ -292,10 +291,19 @@ class DFlashDecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
-        # Self-attention with target context
+        # Self-attention (cache contains materialized target context)
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, target_hidden, position_embeddings, mask, cache)
+
+        # Handle cache - pass layer_idx for DFlashCacheManager
+        cache_to_use = None
+        if cache is not None:
+            if isinstance(cache, DFlashCacheManager):
+                cache_to_use = cache.get_layer_cache(self.layer_idx)
+            else:
+                cache_to_use = cache
+
+        hidden_states = self.self_attn(hidden_states, position_embeddings, mask, cache_to_use)
         hidden_states = residual + hidden_states
 
         # MLP
@@ -385,7 +393,8 @@ class Model(nn.Module):
         self.rotary_emb = RoPE(args)
 
     def make_cache(self):
-        return [KVCache() for _ in range(self.args.num_hidden_layers)]
+        """Create a DFlash cache manager with cropping support."""
+        return DFlashCacheManager(self.args.num_hidden_layers, self.args.block_size)
 
     def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
         """Clean up weights before loading.
@@ -409,6 +418,54 @@ class Model(nn.Module):
         compressed_target_flat = self.hidden_norm(self.fc(target_hidden_flat))
         return compressed_target_flat.reshape(B, ctx_len, -1)
 
+    def materialize_target_hidden(
+        self,
+        target_hidden: mx.array,
+        cache: Any,  # DFlashCacheManager or list
+        position_ids: Optional[mx.array] = None,
+    ) -> None:
+        """Materialize target hidden states into draft KV cache.
+
+        This projects the target model's hidden states and adds them as K/V
+        to the draft model's cache, giving the draft model proper context.
+
+        Args:
+            target_hidden: [B, ctx_len, num_layers * D] - raw target features
+            cache: DFlashCacheManager or list of caches to update
+            position_ids: [B, ctx_len] - position IDs for target context (optional)
+        """
+        B, ctx_len, _ = target_hidden.shape
+
+        # Project target hidden states to draft dimension
+        compressed_hidden = self.project_target_hidden(target_hidden)
+
+        # Create position IDs if not provided
+        if position_ids is None:
+            position_ids = mx.arange(ctx_len)[None, :]
+
+        # Compute position embeddings for target context
+        position_embeddings = self.rotary_emb(compressed_hidden, position_ids)
+
+        # Materialize into each layer's cache
+        for layer_idx, layer in enumerate(self.layers):
+            # Get the appropriate cache for this layer
+            if isinstance(cache, DFlashCacheManager):
+                layer_cache = cache.get_layer_cache(layer_idx)
+            else:
+                layer_cache = cache[layer_idx]
+
+            # Get K/V projections only (skip Q since we're just materializing context)
+            k, v = layer.self_attn.kv_proj_only(compressed_hidden)
+
+            # Apply K normalization
+            k = layer.self_attn.apply_k_norm(k)
+
+            # Apply RoPE to K
+            k = layer.self_attn.apply_k_rope(position_ids.reshape(-1), k, self.rotary_emb)
+
+            # Update cache with target context K/V
+            layer_cache.update_and_fetch(k, v)
+
     def __call__(
         self,
         position_ids: mx.array,
@@ -419,7 +476,7 @@ class Model(nn.Module):
         Args:
             position_ids: [B, L] - absolute positions for noise tokens
             noise_embedding: [B, L, D] - embeddings from mask tokens
-            cache: KV caches (should already contain materialized target context)
+            cache: DFlashCacheManager or list of caches (should already contain materialized target context)
 
         Returns:
             Hidden states [B, L, D]
@@ -429,7 +486,16 @@ class Model(nn.Module):
 
         # Process through decoder layers
         hidden_states = noise_embedding
-        for layer, c in zip(self.layers, cache or [None] * len(self.layers)):
+        if cache is None:
+            caches = [None] * len(self.layers)
+        elif isinstance(cache, DFlashCacheManager):
+            # DFlashCacheManager - each layer will fetch its own cache
+            caches = [cache] * len(self.layers)
+        else:
+            # List of caches
+            caches = cache
+
+        for layer, c in zip(self.layers, caches):
             hidden_states = layer(hidden_states, position_embeddings, cache=c)
 
         return self.norm(hidden_states)
