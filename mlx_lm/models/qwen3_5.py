@@ -551,6 +551,9 @@ class Model(nn.Module):
     def make_cache(self):
         return self.language_model.make_cache()
 
+    def make_speculative_cache(self, max_size: int = 8192):
+        return self.language_model.make_speculative_cache(max_size)
+
     @property
     def quant_predicate(self):
         return self.language_model.quant_predicate
