@@ -9,7 +9,7 @@ Aligned with the reference PyTorch implementation:
 - Target cache cropped to `start` after each iteration
 """
 
-from typing import Any, Generator, List, Optional, Tuple, Union
+from typing import Any, Callable, Generator, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -29,21 +29,21 @@ def get_inner_model(model: nn.Module) -> nn.Module:
     return inner_model
 
 
-def get_lm_head(model: nn.Module) -> nn.Module:
-    """Get the correct lm_head for computing logits.
+def get_lm_head(model: nn.Module) -> Callable:
+    """Get a callable that computes logits from hidden states.
 
-    For models with tie_word_embeddings=True, the lm_head IS embed_tokens
-    (accessed via as_linear). For models with tie_word_embeddings=False,
-    there's a separate lm_head linear layer.
+    For models with tie_word_embeddings=True, wraps embed_tokens.as_linear.
+    For models with tie_word_embeddings=False, returns lm_head directly.
     """
     language_model = model
     if hasattr(language_model, 'language_model'):
         language_model = language_model.language_model
     if hasattr(language_model, 'lm_head'):
         return language_model.lm_head
-    # tie_word_embeddings=True fallback
+    # tie_word_embeddings=True — wrap embed_tokens.as_linear as a callable
     inner = get_inner_model(model)
-    return inner.embed_tokens
+    embed = inner.embed_tokens
+    return lambda h: embed.as_linear(h)
 
 
 def extract_context_feature(

@@ -712,6 +712,7 @@ def stream_generate(
 
     if draft_model is None:
         kwargs.pop("num_draft_tokens", None)
+        kwargs.pop("block_size", None)
         token_generator = generate_step(prompt, model, **kwargs)
         # from_draft always false for non-speculative generation
         token_generator = (
@@ -736,6 +737,7 @@ def stream_generate(
             kwargs.pop("prompt_cache", None)
             kwargs.pop("logits_processors", None)
             kwargs.pop("prefill_step_size", None)
+            kwargs.pop("block_size", None)
             token_generator = block_diffusion_generate_step(
                 prompt, model, draft_model, tokenizer, **kwargs
             )
