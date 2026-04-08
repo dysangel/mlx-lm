@@ -186,14 +186,26 @@ def block_diffusion_generate_step(
         draft_model.target_layer_ids,
     )
 
-    # Now process first token through cache
-    first_token_input = mx.array([[first_token]])
-    target_model_with_hidden(first_token_input, cache=target_cache)
+    # Yield first token
+    first_token = tokens[-1].item()
+    first_logprobs = logprobs[-1]
+    yield first_token, first_logprobs, False
+    ntoks = 1
+
+    # Extract context features from target model (only prompt tokens, not first generated token)
+    # This matches the reference which uses only prompt context for initial materialization
+    target_hidden = extract_context_feature(
+        target_model_with_hidden.hidden_states,
+        draft_model.target_layer_ids,
+    )
 
     # Materialize target context into draft cache ONCE
     ctx_len = target_hidden.shape[1]
     ctx_position_ids = mx.arange(ctx_len)[None, :]
     draft_model.materialize_target_hidden(target_hidden, draft_cache, ctx_position_ids)
+
+    # Update noise_start to track where noise tokens begin (after context)
+    draft_cache.update_noise_start(ctx_len)
 
     # Get inner model for embeddings
     target_inner = get_inner_model(model)
@@ -207,98 +219,39 @@ def block_diffusion_generate_step(
     # Position for next token
     start = num_input_tokens + 1
 
-    # Decode loop
+    # Decode loop - simplified: just use target model for now
+    iteration = 0
     while ntoks < max_tokens:
+        iteration += 1
         remaining = max_tokens - ntoks
         current_block_size = min(block_size, remaining)
+        logger.debug(f"Iteration {iteration}: ntoks={ntoks}, remaining={remaining}")
 
+        # Use target model directly - skip draft for now to get baseline
         with mx.stream(generation_stream):
-            # Get block of tokens from output_ids
-            # Include previous token as seed (like reference)
-            prev_token = output_ids[:, start - 1][:, None]  # [1] -> [1, 1]
-            block_output_ids = mx.concatenate([prev_token, output_ids[:, start : start + current_block_size - 1]], axis=-1)
-
-            # Create embeddings from tokens
-            noise_embedding = target_inner.embed_tokens(block_output_ids)
-
-            # Create position_ids for the draft model
-            # Use cache manager's current size to determine starting position
-            cache_size = draft_cache.total_size()
-            noise_position_ids = mx.arange(cache_size - 1, cache_size - 1 + current_block_size)[None, :]
-
-            # Draft model generates
-            draft_output = draft_model(
-                position_ids=noise_position_ids,
-                noise_embedding=noise_embedding,
-                cache=draft_cache,
-            )
-
-            # Get draft logits using target model's lm_head
-            if hasattr(model, 'lm_head'):
-                draft_logits = model.lm_head(draft_output)
-            else:
-                draft_logits = target_inner.embed_tokens.as_linear(draft_output)
-
-            # Force evaluation
-            mx.eval(draft_logits)
-
-            # Sample draft tokens (skip first position which is the seed token)
-            draft_tokens_block = mx.argmax(draft_logits[:, -current_block_size + 1:, :], axis=-1).squeeze(0)
-
-            # Convert draft_logits to logprobs for yielding
-            draft_logprobs = draft_logits - mx.logsumexp(draft_logits, axis=-1, keepdims=True)
-
-            # For now, skip draft model entirely - just use target model
-            # This establishes a clean baseline
-            acceptance_length = 0
-
-            # Predict next token from target model using current cache state
-            # Use a repeat of the last token to trigger prediction
             last_token_id = output_ids[:, start - 1].item()
             token_input = mx.array([[last_token_id]])
-            target_output = target_model_with_hidden(token_input, cache=target_cache)
-            mx.eval(target_output.logits)
-            final_token = sampler(target_output.logits[0, -1:, :])[0].item()
+            logits = model(token_input, cache=target_cache)
+            mx.eval(logits)
+            token = sampler(logits[0, -1:, :])[0].item()
 
-            # Update output_ids
-            for i in range(acceptance_length):
-                output_ids[:, start + i] = draft_tokens_block[i].item()
-            output_ids[:, start + acceptance_length] = final_token
+        # Update output_ids
+        output_ids[:, start] = token
 
-            # Yield accepted draft tokens
-            for i in range(acceptance_length):
-                yield draft_tokens_block[i].item(), draft_logprobs[:, i, :].squeeze(0), True
-                ntoks += 1
-                if ntoks >= max_tokens:
-                    break
+        # Yield token
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        logger.debug(f"Yielding token: {token}")
+        yield token, logprobs[:, -1, :].squeeze(0), False
+        ntoks += 1
 
-            if ntoks >= max_tokens:
-                break
+        # Clear cache periodically
+        if ntoks % 256 == 0:
+            mx.clear_cache()
 
-            # Yield final target token
-            target_logprobs = target_output.logits - mx.logsumexp(target_output.logits, axis=-1, keepdims=True)
-            yield final_token, target_logprobs[:, -1, :].squeeze(0), False
-            ntoks += 1
+        if ntoks >= max_tokens:
+            break
 
-            # Clear cache periodically to prevent memory buildup
-            if ntoks % 256 == 0:
-                mx.clear_cache()
-
-            if ntoks >= max_tokens:
-                break
-
-            # Move start forward
-            start += acceptance_length + 1
-
-            # Update target_hidden to include newly generated tokens
-            new_target_hidden = extract_context_feature(target_output.hidden_states, draft_model.target_layer_ids)[:, -acceptance_length - 1:, :]
-            target_hidden = mx.concatenate([target_hidden, new_target_hidden], axis=1)
-
-            # Crop noise tokens from draft cache and rematerialize updated context
-            # This removes the noise tokens we just processed, keeping only context
-            draft_cache.crop_noise_tokens()
-
-            # Rematerialize updated target context (includes newly generated tokens)
-            draft_model.materialize_target_hidden(target_hidden, draft_cache)
+        # Move start forward
+        start += 1
 
     return

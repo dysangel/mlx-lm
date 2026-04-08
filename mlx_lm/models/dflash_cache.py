@@ -54,6 +54,29 @@ class CroppableKVCache:
             return 0
         return self.keys.shape[2]
 
+    def trim(self, num_tokens: int) -> int:
+        """Trim the last num_tokens from the cache.
+
+        Args:
+            num_tokens: Number of tokens to trim from the end
+
+        Returns:
+            Actual number of tokens trimmed
+        """
+        if self.keys is None:
+            return 0
+        current_size = self.keys.shape[2]
+        actual_trim = min(num_tokens, current_size)
+        keep_size = current_size - actual_trim
+        if keep_size > 0:
+            self.keys = self.keys[:, :, :keep_size, :]
+            self.values = self.values[:, :, :keep_size, :]
+        else:
+            # Keep at least one token
+            self.keys = self.keys[:, :, :1, :]
+            self.values = self.values[:, :, :1, :]
+        return actual_trim
+
     def update_and_fetch(self, k: mx.array, v: mx.array) -> Tuple[mx.array, mx.array]:
         """Update cache and fetch current state (API compatible with KVCache)."""
         return self.update(k, v)
@@ -108,3 +131,16 @@ class DFlashCacheManager:
     def total_size(self) -> int:
         """Get total cache size (same for all layers)."""
         return self.caches[0].size() if self.caches else 0
+
+    def trim(self, num_tokens: int) -> int:
+        """Trim the last num_tokens from all layer caches.
+
+        Args:
+            num_tokens: Number of tokens to trim from the end
+
+        Returns:
+            Actual number of tokens trimmed
+        """
+        if not self.caches:
+            return 0
+        return self.caches[0].trim(num_tokens)  # All layers have same size
