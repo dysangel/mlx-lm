@@ -162,7 +162,11 @@ def block_diffusion_generate_step(
         raise ValueError("Prompt must not be empty")
 
     # Initialize caches
-    target_cache = model.make_cache()
+    # Use SpeculativeArraysCache if available (for checkpoint/rollback support)
+    if hasattr(model, 'make_speculative_cache'):
+        target_cache = model.make_speculative_cache()
+    else:
+        target_cache = model.make_cache()
     draft_cache = draft_model.make_cache()
 
     logger.debug(f"Target cache types: {[type(c).__name__ for c in target_cache[:3]]}")
@@ -281,13 +285,18 @@ def block_diffusion_generate_step(
 
                 logger.debug(f"Draft tokens (first 5): {draft_tokens_block[:5].tolist() if draft_tokens_block.size > 0 else []}")
 
-                # Verify draft tokens WITHOUT cache (avoid ArraysCache pollution)
+                # Verify draft tokens WITH cache (using SpeculativeArraysCache checkpoint/rollback)
                 acceptance_length = 0
                 if draft_tokens_block.size > 0:
+                    # Save checkpoint before verification (for rollback on rejection)
+                    for c in target_cache:
+                        if hasattr(c, 'save_checkpoint'):
+                            c.save_checkpoint()
+
                     # Construct verification input: seed + draft tokens
                     verification_input = mx.concatenate([prev_token, draft_tokens_block[None, :]], axis=-1)
-                    # Verify WITHOUT cache - fresh computation, no cache pollution
-                    output = target_model_with_hidden(verification_input, cache=None)
+                    # Verify WITH cache - SpeculativeArraysCache supports rollback
+                    output = target_model_with_hidden(verification_input, cache=target_cache)
                     logits = output.logits
                     mx.eval(logits)
 
@@ -309,12 +318,23 @@ def block_diffusion_generate_step(
 
                     logger.debug(f"Acceptance: {acceptance_length}/{len(draft_tokens_block)}")
 
-                    # NO cache restore - verification didn't use cache
-                    # Need to update cache with accepted tokens only
-                    # Use verification output for target_hidden (has all tokens)
-                    rebuild_output = output
+                    # Handle cache rollback/commit based on acceptance
+                    if acceptance_length < len(draft_tokens_block):
+                        # Some tokens rejected - rollback cache to checkpoint
+                        for c in target_cache:
+                            if hasattr(c, 'rollback'):
+                                c.rollback()
+                        num_rejected = len(draft_tokens_block) - acceptance_length
+                        logger.debug(f"Rolled back {num_rejected} rejected tokens, cache at position {start}")
+                    else:
+                        # All tokens accepted - commit cache
+                        new_position = start + acceptance_length
+                        for c in target_cache:
+                            if hasattr(c, 'commit'):
+                                c.commit(new_position)
+                        logger.debug(f"All tokens accepted, committed cache to position {new_position}")
 
-                    logger.debug(f"Verified without cache, acceptance: {acceptance_length}")
+                    logger.debug(f"Verified with cache, acceptance: {acceptance_length}")
 
                     # Update output_ids with accepted draft tokens
                     for i in range(acceptance_length):
@@ -352,7 +372,26 @@ def block_diffusion_generate_step(
                     # Rebuild target_hidden from ALL tokens (prompt + all generated)
                     # This gives draft model full context for next iteration
                     all_tokens_array = mx.array(all_accepted_tokens)[None, :]
-                    all_hidden_output = target_model_with_hidden(all_tokens_array, cache=None)
+
+                    # Only rebuild cache if tokens were rejected (rollback happened)
+                    # If all tokens were accepted, cache is already up-to-date from verification
+                    if acceptance_length < len(draft_tokens_block):
+                        # Some tokens were rejected and rolled back - need to rebuild cache
+                        cache_update_output = target_model_with_hidden(all_tokens_array, cache=target_cache)
+                        mx.eval(cache_update_output.logits)
+                        # Commit the rebuilt cache
+                        new_position = total_tokens
+                        for c in target_cache:
+                            if hasattr(c, 'commit'):
+                                c.commit(new_position)
+                        logger.debug(f"Rebuilt cache to position {new_position} after partial acceptance")
+                        # Use verification output for target_hidden
+                        all_hidden_output = output
+                    else:
+                        # All tokens accepted - cache is already up-to-date, rebuild target_hidden without cache
+                        all_hidden_output = target_model_with_hidden(all_tokens_array, cache=None)
+                        mx.eval(all_hidden_output.logits)
+
                     mx.eval(all_hidden_output.logits)
 
                     # Extract target_hidden from all tokens
@@ -367,16 +406,6 @@ def block_diffusion_generate_step(
 
                     # Advance start by acceptance_length + 1 (like reference)
                     start += acceptance_length + 1
-
-                    # Update cache with accepted tokens for next iteration
-                    # Run forward pass for all accepted tokens to update cache
-                    cache_update_output = target_model_with_hidden(all_tokens_array, cache=target_cache)
-                    mx.eval(cache_update_output.logits)
-
-                    # Crop cache to start position
-                    for c in target_cache:
-                        if hasattr(c, 'trim') and hasattr(c, 'offset') and c.offset > start:
-                            c.trim(c.offset - start)
 
                     if ntoks >= max_tokens:
                         break

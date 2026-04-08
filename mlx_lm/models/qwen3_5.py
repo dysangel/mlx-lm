@@ -14,6 +14,7 @@ from .base import (
     create_ssm_mask,
 )
 from .cache import ArraysCache, KVCache
+from .speculative_cache import SpeculativeArraysCache
 from .gated_delta import gated_delta_update
 from .qwen3_next import Qwen3NextAttention as Attention
 from .qwen3_next import Qwen3NextMLP as MLP
@@ -312,6 +313,25 @@ class TextModel(nn.Module):
 
     def make_cache(self):
         return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]
+
+    def make_speculative_cache(self, max_size: int = 8192):
+        """Create cache for speculative decoding with checkpoint/rollback support.
+
+        This creates SpeculativeArraysCache for linear attention layers, which
+        supports checkpoint/rollback operations needed for speculative decoding.
+
+        Args:
+            max_size: Maximum sequence length for cache pre-allocation
+
+        Returns:
+            List of cache objects (SpeculativeArraysCache for linear layers, KVCache for others)
+        """
+        return [
+            SpeculativeArraysCache(size=2, conv_kernel_size=4, max_size=max_size)
+            if l.is_linear
+            else KVCache()
+            for l in self.layers
+        ]
 
     def sanitize(self, weights):
         has_mtp_weights = any("mtp." in k for k in weights)
