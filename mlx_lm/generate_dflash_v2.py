@@ -328,7 +328,11 @@ def block_diffusion_generate_step(
 
                     # Yield accepted draft tokens
                     for i in range(acceptance_length):
-                        yield draft_tokens[i + 1].item(), draft_logits[:, i, :], True
+                        # draft_tokens_block[i] corresponds to draft_logits[:, i + 1, :]
+                        # because we sampled from draft_logits[:, -current_block_size + 1:, :]
+                        token_id = draft_tokens[i + 1].item()
+                        output_ids[:, start + i] = token_id  # Update output_ids
+                        yield token_id, draft_logits[:, i + 1, :], True
                         ntoks += 1
                         if ntoks >= max_tokens:
                             break
@@ -338,19 +342,24 @@ def block_diffusion_generate_step(
 
                     # Yield one target token (from verification step)
                     target_token = mx.argmax(logits[:, -1, :], axis=-1).squeeze(0)
+                    output_ids[:, start + acceptance_length] = target_token  # Update output_ids
                     yield target_token.item(), logits[:, -1, :], False
                     ntoks += 1
 
                     # Track the target token we just yielded
                     accumulated_tokens.append(target_token.item())
 
-                    # Update target_hidden using output.hidden_states from verification step
-                    # Reference: extract_context_feature(output.hidden_states, ...)[:, :acceptance_length + 1, :]
-                    # Slice to keep only accepted tokens + 1 target token (sliding window)
+                    # Update target_hidden: use FULL accumulated context
+                    # PyTorch reference might return full sequence hidden_states from cached calls
+                    # MLX only returns new tokens, so we use accumulated_hidden (full context)
+                    # First, append verification hidden states to accumulated_hidden
+                    for i, h in enumerate(target_model_with_hidden.hidden_states):
+                        accumulated_hidden[i] = mx.concatenate([accumulated_hidden[i], h], axis=1)
+
                     target_hidden = extract_context_feature(
-                        target_model_with_hidden.hidden_states,
+                        accumulated_hidden,
                         draft_model.target_layer_ids,
-                    )[:, :acceptance_length + 1, :]
+                    )
                     mx.eval(target_hidden)
 
                     # Update ctx_len to match current target_hidden size
@@ -368,17 +377,18 @@ def block_diffusion_generate_step(
 
                 # Sample and yield target token
                 target_token = mx.argmax(logits[:, -1, :], axis=-1).squeeze(0)
+                output_ids[:, start] = target_token  # Update output_ids
                 yield target_token.item(), logits[:, -1, :], False
                 ntoks += 1
 
                 # Track the target token
                 accumulated_tokens.append(target_token.item())
 
-                # Update target_hidden using sliding window (acceptance_length = 1 for iteration 1)
+                # Update target_hidden: use FULL accumulated context
                 target_hidden = extract_context_feature(
-                    target_model_with_hidden.hidden_states,
+                    accumulated_hidden,
                     draft_model.target_layer_ids,
-                )[:, :1, :]
+                )
                 mx.eval(target_hidden)
 
                 # Update ctx_len to match current target_hidden size
