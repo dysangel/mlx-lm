@@ -258,13 +258,26 @@ def block_diffusion_generate_step(
 
                 logger.debug(f"Generated {len(draft_tokens_block)} draft tokens")
 
-                # TEST: Verify draft tokens WITHOUT using cache
-                # This avoids cache pollution but is slower
+                # Verify draft tokens using cache with proper rollback
                 acceptance_length = 0
                 if draft_tokens_block.size > 0:
-                    # Run draft tokens through target model WITHOUT cache
+                    # Save cache state for rollback
+                    # Cache structure: list of ArraysCache, each with .cache = [keys, values]
+                    saved_cache_state = []
+                    for layer_cache in target_cache:
+                        if hasattr(layer_cache, 'cache'):  # ArraysCache
+                            # Copy the [keys, values] list
+                            saved_cache_state.append([
+                                mx.array(arr) if arr is not None else None
+                                for arr in layer_cache.cache
+                            ])
+                        else:
+                            # Direct KVCache - save its state
+                            saved_cache_state.append(layer_cache.state)
+
+                    # Run draft tokens through target model WITH cache
                     target_verify_input = draft_tokens_block[None, :]
-                    logits = model(target_verify_input, cache=None)
+                    logits = model(target_verify_input, cache=target_cache)
                     mx.eval(logits)
 
                     # Get target predictions
@@ -280,11 +293,14 @@ def block_diffusion_generate_step(
 
                         logger.debug(f"Acceptance: {acceptance_length}/{len(draft_tokens_block)}")
 
-                        # Now add accepted tokens to cache one by one
-                        for i in range(acceptance_length):
-                            token_input = mx.array([[draft_tokens_block[i].item()]])
-                            _ = model(token_input, cache=target_cache)
-                            mx.eval(target_cache)
+                        # Rollback cache if not all tokens accepted
+                        if acceptance_length < len(draft_tokens_block):
+                            # Restore saved state
+                            for i, layer_cache in enumerate(target_cache):
+                                if hasattr(layer_cache, 'cache'):  # ArraysCache
+                                    layer_cache.cache = saved_cache_state[i]
+                                else:
+                                    layer_cache.state = saved_cache_state[i]
 
                     # Note: start will be updated after yielding
 
