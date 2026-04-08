@@ -219,16 +219,76 @@ def block_diffusion_generate_step(
     # Position for next token
     start = num_input_tokens + 1
 
-    # Decode loop - target only for baseline
-    # TODO: Add draft model verification once cache corruption is fixed
+    # Decode loop - test draft verification
     iteration = 0
     while ntoks < max_tokens:
         iteration += 1
         remaining = max_tokens - ntoks
+        current_block_size = min(block_size, remaining)
         logger.debug(f"Iteration {iteration}: ntoks={ntoks}, remaining={remaining}")
 
-        # Use target model directly
         with mx.stream(generation_stream):
+            # Generate draft tokens (but don't use them yet)
+            if iteration > 1:
+                prev_token = output_ids[:, start - 1][:, None]
+                noise_tokens = mx.zeros([1, max(0, current_block_size - 1)], dtype=mx.uint32)
+                draft_input = mx.concatenate([prev_token, noise_tokens], axis=-1) if current_block_size > 1 else prev_token
+                noise_embedding = target_inner.embed_tokens(draft_input)
+                cache_size = draft_cache.total_size()
+                noise_position_ids = mx.arange(cache_size, cache_size + current_block_size)[None, :]
+                draft_output = draft_model(
+                    position_ids=noise_position_ids,
+                    noise_embedding=noise_embedding,
+                    cache=draft_cache,
+                )
+                mx.eval(draft_output)
+
+                # Get draft logits
+                if hasattr(model, 'lm_head'):
+                    draft_logits = model.lm_head(draft_output)
+                else:
+                    draft_logits = target_inner.embed_tokens.as_linear(draft_output)
+                mx.eval(draft_logits)
+
+                # Sample draft tokens
+                if draft_logits.shape[1] > 1:
+                    draft_tokens_block = mx.argmax(draft_logits[:, 1:, :], axis=-1).squeeze(0)
+                else:
+                    draft_tokens_block = mx.array([], dtype=mx.uint32)
+
+                logger.debug(f"Generated {len(draft_tokens_block)} draft tokens")
+
+                # TEST: Verify draft tokens WITHOUT using cache
+                # This avoids cache pollution but is slower
+                acceptance_length = 0
+                if draft_tokens_block.size > 0:
+                    # Run draft tokens through target model WITHOUT cache
+                    target_verify_input = draft_tokens_block[None, :]
+                    logits = model(target_verify_input, cache=None)
+                    mx.eval(logits)
+
+                    # Get target predictions
+                    if logits.ndim == 3 and logits.shape[1] >= draft_tokens_block.size:
+                        target_tokens = mx.argmax(logits[:, :draft_tokens_block.size, :], axis=-1).squeeze(0)
+
+                        # Check acceptance
+                        for i in range(min(len(draft_tokens_block), len(target_tokens))):
+                            if draft_tokens_block[i].item() == target_tokens[i].item():
+                                acceptance_length += 1
+                            else:
+                                break
+
+                        logger.debug(f"Acceptance: {acceptance_length}/{len(draft_tokens_block)}")
+
+                        # Now add accepted tokens to cache one by one
+                        for i in range(acceptance_length):
+                            token_input = mx.array([[draft_tokens_block[i].item()]])
+                            _ = model(token_input, cache=target_cache)
+                            mx.eval(target_cache)
+
+                    # Note: start will be updated after yielding
+
+            # Use target model directly
             last_token_id = output_ids[:, start - 1].item()
             token_input = mx.array([[last_token_id]])
             logits = model(token_input, cache=target_cache)
