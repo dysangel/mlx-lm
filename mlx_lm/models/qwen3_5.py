@@ -161,9 +161,18 @@ class GatedDeltaNet(nn.Module):
             if cache.lengths is not None:
                 ends = mx.clip(cache.lengths, 0, S)
                 positions = (ends[:, None] + mx.arange(n_keep))[..., None]
-                cache[0] = mx.take_along_axis(conv_input, positions, axis=1)
+                new_cache_0 = mx.take_along_axis(conv_input, positions, axis=1)
+                cache[0] = new_cache_0
             else:
-                cache[0] = mx.contiguous(conv_input[:, -n_keep:, :])
+                new_cache_0 = mx.contiguous(conv_input[:, -n_keep:, :])
+                import os
+                if os.environ.get('DEBUG_CACHE'):
+                    print(f"DEBUG: conv_input.shape={conv_input.shape}, n_keep={n_keep}")
+                    print(f"DEBUG: new_cache_0.shape={new_cache_0.shape}")
+                    print(f"DEBUG: cache[0].shape BEFORE={cache.cache[0].shape if cache.cache[0] is not None else None}")
+                cache[0] = new_cache_0
+                if os.environ.get('DEBUG_CACHE'):
+                    print(f"DEBUG: cache[0].shape AFTER={cache.cache[0].shape if cache.cache[0] is not None else None}")
         conv_out = nn.silu(self.conv1d(conv_input))
 
         q, k, v = [
