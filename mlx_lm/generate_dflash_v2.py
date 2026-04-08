@@ -40,13 +40,21 @@ def extract_context_feature(
 
 
 def _crop_cache(cache_list, target_len):
-    """Crop all caches in a list to target_len positions."""
+    """Crop all caches to keep only the first target_len positions.
+
+    For KVCache: adjust offset (ring buffer, truncates logical end).
+    For SpeculativeArraysCache: slice arrays to target_len (removes from end).
+    """
     for c in cache_list:
         if hasattr(c, 'keys') and c.keys is not None:
-            # KVCache: uses offset to track real length, keys may be padded
+            # KVCache: uses offset to track real length
             if c.offset > target_len:
                 c.offset = target_len
+        elif hasattr(c, 'crop'):
+            # SpeculativeArraysCache: truncate arrays from end
+            c.crop(target_len)
         elif hasattr(c, 'trim'):
+            # Fallback
             current = c.offset if hasattr(c, 'offset') else 0
             if current > target_len:
                 c.trim(current - target_len)
@@ -228,6 +236,11 @@ def block_diffusion_generate_step(
         block_output_ids[:, 1:] = mx.argmax(draft_logits, axis=-1)
 
         # === VERIFY PHASE ===
+        # Save checkpoint before verify (for rollback on rejection)
+        for c in target_cache:
+            if hasattr(c, 'save_checkpoint'):
+                c.save_checkpoint()
+
         # Run target model on block_output_ids to verify draft tokens
         verify_output = target_model_with_hidden(block_output_ids, cache=target_cache)
         mx.eval(verify_output.logits)
@@ -248,6 +261,42 @@ def block_diffusion_generate_step(
         bonus_token = posterior[:, acceptance_length].squeeze()
         output_ids[:, start + acceptance_length] = bonus_token
 
+        # Rollback target cache if tokens were rejected
+        if acceptance_length < current_block_size - 1:
+            # Some tokens rejected — rollback to checkpoint and rebuild
+            for c in target_cache:
+                if hasattr(c, 'rollback'):
+                    # SpeculativeArraysCache: restore checkpoint
+                    c.rollback()
+                elif hasattr(c, 'keys') and c.keys is not None:
+                    # KVCache: trim rejected tokens from end
+                    num_to_trim = current_block_size - (acceptance_length + 1)
+                    c.offset = c.offset - num_to_trim
+
+            # Rebuild target cache with only accepted + bonus tokens
+            if acceptance_length > 0:
+                rebuild_tokens = mx.concatenate([
+                    block_output_ids[:, :acceptance_length],
+                    bonus_token[None, None],
+                ], axis=-1)
+            else:
+                rebuild_tokens = bonus_token[None, None]
+            rebuild_output = target_model_with_hidden(rebuild_tokens, cache=target_cache)
+            mx.eval(rebuild_output.logits)
+
+            # Use rebuild logits and hidden states
+            target_hidden = extract_context_feature(
+                rebuild_output.hidden_states, draft_model.target_layer_ids
+            )[:, :acceptance_length + 1, :]
+            mx.eval(target_hidden)
+
+        else:
+            # Full acceptance: cache already has all tokens, no rollback needed
+            target_hidden = extract_context_feature(
+                verify_output.hidden_states, draft_model.target_layer_ids
+            )[:, :acceptance_length + 1, :]
+            mx.eval(target_hidden)
+
         # Yield accepted draft tokens
         for i in range(acceptance_length):
             token_id = block_output_ids[0, i].item()
@@ -258,15 +307,9 @@ def block_diffusion_generate_step(
         yield bonus_token.item(), verify_output.logits[:, acceptance_length, :], False
         ntoks += 1
 
-        # Update target_hidden: only the accepted chunk (matching reference line 279)
-        target_hidden = extract_context_feature(
-            verify_output.hidden_states, draft_model.target_layer_ids
-        )[:, :acceptance_length + 1, :]
-        mx.eval(target_hidden)
-
-        # Crop target cache to new start position
+        # Crop draft cache to new start position
         new_start = start + acceptance_length + 1
-        _crop_cache(target_cache, new_start)
+        _crop_cache(draft_cache, new_start)
 
         start = new_start
 

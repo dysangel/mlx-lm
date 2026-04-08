@@ -247,6 +247,25 @@ class SpeculativeArraysCache(_BaseCache):
         """Return True - this cache supports trim operations."""
         return True
 
+    def crop(self, target_len):
+        """Crop cache to keep only the first target_len tokens.
+
+        Unlike trim() which removes from the beginning, this removes
+        tokens from the END — used for discarding rejected speculative
+        tokens while keeping verified context.
+
+        Args:
+            target_len: Number of tokens to keep from the beginning
+        """
+        if self.cache[0] is None:
+            return
+        current_len = self.cache[0].shape[1] if len(self.cache[0].shape) >= 2 else 0
+        if current_len > target_len:
+            for i in range(len(self.cache)):
+                if self.cache[i] is not None:
+                    self.cache[i] = self.cache[i][:, :target_len, ...]
+            self._committed_up_to = min(self._committed_up_to, target_len)
+
     def advance(self, N):
         """Advance cache position by N tokens."""
         if self.lengths is not None:
