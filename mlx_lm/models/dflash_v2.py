@@ -74,7 +74,7 @@ class ModelArgs:
     vocab_size: int = 248320
     tie_word_embeddings: bool = True
     # DFlash-specific
-    block_size: int = 16
+    block_size: int = 4
     num_target_layers: int = 32
     target_layer_ids: Optional[List[int]] = None
     mask_token_id: Optional[int] = None

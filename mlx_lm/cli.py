@@ -10,6 +10,7 @@ def main():
         "cache_prompt",
         "chat",
         "convert",
+        "dflash",
         "evaluate",
         "fuse",
         "generate",
