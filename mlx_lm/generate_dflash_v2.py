@@ -29,6 +29,23 @@ def get_inner_model(model: nn.Module) -> nn.Module:
     return inner_model
 
 
+def get_lm_head(model: nn.Module) -> nn.Module:
+    """Get the correct lm_head for computing logits.
+
+    For models with tie_word_embeddings=True, the lm_head IS embed_tokens
+    (accessed via as_linear). For models with tie_word_embeddings=False,
+    there's a separate lm_head linear layer.
+    """
+    language_model = model
+    if hasattr(language_model, 'language_model'):
+        language_model = language_model.language_model
+    if hasattr(language_model, 'lm_head'):
+        return language_model.lm_head
+    # tie_word_embeddings=True fallback
+    inner = get_inner_model(model)
+    return inner.embed_tokens
+
+
 def extract_context_feature(
     hidden_states: List[mx.array],
     layer_ids: List[int],
@@ -191,7 +208,7 @@ def block_diffusion_generate_step(
     output_ids[:, num_input_tokens] = first_token
 
     # Yield first token
-    yield first_token.item(), prefill_output.logits[:, -1, :], False
+    yield first_token.item(), prefill_output.logits[:, -1, :].squeeze(0), False
     ntoks = 1
 
     start = num_input_tokens  # Start at first generated token position
@@ -224,7 +241,8 @@ def block_diffusion_generate_step(
             cache=draft_cache,
         )
         # Only take the last current_block_size-1 positions (skip prev_token)
-        draft_logits = target_inner.embed_tokens.as_linear(
+        lm_head = get_lm_head(model)
+        draft_logits = lm_head(
             draft_output[:, -current_block_size + 1:, :]
         )
         mx.eval(draft_logits)
@@ -272,7 +290,7 @@ def block_diffusion_generate_step(
         # Bonus and target_hidden from verify logits (valid for causal attention:
         # position al only depends on positions 0..al)
         bonus_token = posterior[:, acceptance_length].squeeze()
-        bonus_logits = verify_output.logits[:, acceptance_length, :]
+        bonus_logits = verify_output.logits[:, acceptance_length, :].squeeze(0)
 
         target_hidden = extract_context_feature(
             verify_output.hidden_states, draft_model.target_layer_ids
@@ -285,7 +303,7 @@ def block_diffusion_generate_step(
 
         # Yield accepted draft tokens (positions 1..acceptance_length in block)
         for i in range(acceptance_length):
-            yield block_output_ids[0, i + 1].item(), draft_logits[:, i, :], True
+            yield block_output_ids[0, i + 1].item(), draft_logits[:, i, :].squeeze(0), True
             ntoks += 1
 
         # Yield bonus target token

@@ -718,8 +718,11 @@ def stream_generate(
         if is_dflash:
             # Use DFlash block diffusion generation (v2 - reference port)
             from .generate_dflash_v2 import block_diffusion_generate_step
-            # Pop num_draft_tokens since DFlash uses block_size instead
+            # Pop kwargs not supported by DFlash
             kwargs.pop("num_draft_tokens", None)
+            kwargs.pop("prompt_cache", None)
+            kwargs.pop("logits_processors", None)
+            kwargs.pop("prefill_step_size", None)
             token_generator = block_diffusion_generate_step(
                 prompt, model, draft_model, tokenizer, **kwargs
             )
