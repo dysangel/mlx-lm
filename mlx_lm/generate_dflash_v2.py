@@ -9,6 +9,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .models.cache import KVCache
+from .models.base import create_attention_mask, create_ssm_mask
 from .sample_utils import make_sampler
 
 # Create a global stream for generation
@@ -77,9 +78,18 @@ class ModelWithHiddenStates(nn.Module):
         if cache is None:
             cache = [None] * len(inner_model.layers)
 
-        # Process through layers with cache
-        for i, (layer, c) in enumerate(zip(inner_model.layers, cache)):
-            h = layer(h, mask=None, cache=c)
+        # Generate proper masks for Qwen3.5 (linear attention + full attention layers)
+        # Get fa_idx and ssm_idx from the model
+        fa_idx = getattr(inner_model, 'fa_idx', 3)  # Default to 3 for Qwen3.5
+        ssm_idx = getattr(inner_model, 'ssm_idx', 0)  # Default to 0
+
+        fa_mask = create_attention_mask(h, cache[fa_idx] if fa_idx < len(cache) else None)
+        ssm_mask = create_ssm_mask(h, cache[ssm_idx] if ssm_idx < len(cache) else None)
+
+        # Process through layers with proper masks
+        for layer, c in zip(inner_model.layers, cache):
+            mask = ssm_mask if layer.is_linear else fa_mask
+            h = layer(h, mask=mask, cache=c)
             self.hidden_states.append(h)
 
         # Final normalization
@@ -284,18 +294,13 @@ def block_diffusion_generate_step(
 
             logger.debug(f"Draft tokens (first 5): {draft_tokens_block[:5].tolist() if draft_tokens_block.size > 0 else []}")
 
-            # Verify draft tokens WITH cache (using SpeculativeArraysCache checkpoint/rollback)
+            # Verify draft tokens WITHOUT cache (safe approach to avoid cache corruption)
             acceptance_length = 0
             if draft_tokens_block.size > 0:
-                # Save checkpoint before verification (for rollback on rejection)
-                for c in target_cache:
-                    if hasattr(c, 'save_checkpoint'):
-                        c.save_checkpoint()
-
                 # Construct verification input: seed + draft tokens
                 verification_input = mx.concatenate([prev_token, draft_tokens_block[None, :]], axis=-1)
-                # Verify WITH cache - SpeculativeArraysCache supports rollback
-                output = target_model_with_hidden(verification_input, cache=target_cache)
+                # Verify WITHOUT cache - prevents any cache corruption issues
+                output = target_model_with_hidden(verification_input, cache=None)
                 logits = output.logits
                 mx.eval(logits)
 
@@ -316,24 +321,7 @@ def block_diffusion_generate_step(
                 acceptance_length = int(acceptance_length)
 
                 logger.debug(f"Acceptance: {acceptance_length}/{len(draft_tokens_block)}")
-
-                # Handle cache rollback/commit based on acceptance
-                if acceptance_length < len(draft_tokens_block):
-                    # Some tokens rejected - rollback cache to checkpoint
-                    for c in target_cache:
-                        if hasattr(c, 'rollback'):
-                            c.rollback()
-                    num_rejected = len(draft_tokens_block) - acceptance_length
-                    logger.debug(f"Rolled back {num_rejected} rejected tokens, cache at position {start}")
-                else:
-                    # All tokens accepted - commit cache
-                    new_position = start + acceptance_length
-                    for c in target_cache:
-                        if hasattr(c, 'commit'):
-                            c.commit(new_position)
-                    logger.debug(f"All tokens accepted, committed cache to position {new_position}")
-
-                logger.debug(f"Verified with cache, acceptance: {acceptance_length}")
+                logger.debug(f"Verified WITHOUT cache (safe mode)")
 
                 # Update output_ids with accepted draft tokens
                 for i in range(acceptance_length):
@@ -372,26 +360,16 @@ def block_diffusion_generate_step(
                 # This gives draft model full context for next iteration
                 all_tokens_array = mx.array(all_accepted_tokens)[None, :]
 
-                # Only rebuild cache if tokens were rejected (rollback happened)
-                # If all tokens were accepted, cache is already up-to-date from verification
-                if acceptance_length < len(draft_tokens_block):
-                    # Some tokens were rejected and rolled back - need to rebuild cache
-                    cache_update_output = target_model_with_hidden(all_tokens_array, cache=target_cache)
-                    mx.eval(cache_update_output.logits)
-                    # Commit the rebuilt cache
-                    new_position = total_tokens
-                    for c in target_cache:
-                        if hasattr(c, 'commit'):
-                            c.commit(new_position)
-                    logger.debug(f"Rebuilt cache to position {new_position} after partial acceptance")
-                    # Use verification output for target_hidden
-                    all_hidden_output = output
-                else:
-                    # All tokens accepted - cache is already up-to-date, rebuild target_hidden without cache
-                    all_hidden_output = target_model_with_hidden(all_tokens_array, cache=None)
-                    mx.eval(all_hidden_output.logits)
-
-                mx.eval(all_hidden_output.logits)
+                # Since we verified WITHOUT cache, we always need to rebuild the cache
+                # Rebuild cache with ALL accepted tokens for next iteration
+                cache_update_output = target_model_with_hidden(all_tokens_array, cache=target_cache)
+                mx.eval(cache_update_output.logits)
+                new_position = total_tokens
+                for c in target_cache:
+                    if hasattr(c, 'commit'):
+                        c.commit(new_position)
+                logger.debug(f"Rebuilt cache to position {new_position}")
+                all_hidden_output = cache_update_output
 
                 # Extract target_hidden from all tokens
                 target_hidden = extract_context_feature(
