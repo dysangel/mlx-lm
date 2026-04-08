@@ -15,7 +15,7 @@ from .base import (
 )
 from .cache import ArraysCache, KVCache
 from .speculative_cache import SpeculativeArraysCache
-from .gated_delta import gated_delta_update
+from .gated_delta import compute_g, gated_delta_update
 from .qwen3_next import Qwen3NextAttention as Attention
 from .qwen3_next import Qwen3NextMLP as MLP
 from .qwen3_next import Qwen3NextRMSNormGated as RMSNormGated
@@ -174,6 +174,9 @@ class GatedDeltaNet(nn.Module):
                 cache[0] = new_cache_0
                 if os.environ.get('DEBUG_CACHE'):
                     print(f"DEBUG: cache[0].shape AFTER={cache.cache[0].shape if cache.cache[0] is not None else None}")
+            # Save conv_input for speculative decoding state restoration
+            if hasattr(cache, '_recording') and cache._recording:
+                cache._conv_input = conv_input
         conv_out = nn.silu(self.conv1d(conv_input))
 
         q, k, v = [
@@ -189,6 +192,14 @@ class GatedDeltaNet(nn.Module):
         inv_scale = k.shape[-1] ** -0.5
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+
+        # Save q, k, v, g, beta for speculative decoding replay.
+        # This allows restoring the recurrent state to any position without
+        # a full model rebuild — just replay the cheap state update loop.
+        if cache is not None and hasattr(cache, '_recording') and cache._recording:
+            beta = mx.sigmoid(b)
+            g = compute_g(self.A_log, a, self.dt_bias)
+            cache._verify_qkvgb = (q, k, v, g, beta)
 
         out, state = gated_delta_update(
             q,

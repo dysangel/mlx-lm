@@ -54,6 +54,9 @@ class SpeculativeArraysCache(_BaseCache):
         instance.left_padding = None
         instance.lengths = None
         instance._offset = 0
+        instance._recording = False
+        instance._verify_qkvgb = None
+        instance._conv_input = None
         return instance
 
     def __init__(
@@ -160,6 +163,68 @@ class SpeculativeArraysCache(_BaseCache):
                 self.cache[i] = None
 
         logger.debug(f"SpeculativeArraysCache: rollback from {old_committed} to {self._committed_up_to}")
+
+    def start_recording(self):
+        """Enable q/k/v/g/beta saving for the next forward pass.
+
+        When recording is enabled, the linear attention layer saves the
+        intermediate tensors needed to replay the recurrent state update
+        to any position. After the forward pass, call restore_to_position()
+        to set the cache to the correct state via a cheap replay (no full
+        model rebuild needed).
+        """
+        self._recording = True
+        self._verify_qkvgb = None
+        self._conv_input = None
+        # Save checkpoint so replay has the correct starting state
+        self.save_checkpoint()
+
+    def restore_to_position(self, position):
+        """Restore cache to the state at the given block position via replay.
+
+        Replays the cheap recurrent state update for positions 0..position
+        using the q/k/v/g/beta tensors saved during the verify forward pass.
+        This avoids a full model rebuild — just iterates the simple state
+        update loop for acceptance_length+1 positions.
+
+        Args:
+            position: Block position to restore to (0-indexed).
+                The state is restored to what it was after processing
+                tokens 0 through `position`.
+        """
+        from .gated_delta import _gated_delta_step_ops
+
+        if self._verify_qkvgb is not None:
+            q, k, v, g, beta = self._verify_qkvgb
+            # Handle q/k repeat for Hv > Hk (same as gated_delta_ops)
+            Hk = q.shape[-2]
+            Hv = v.shape[-2]
+            if (repeat_factor := Hv // Hk) > 1:
+                q = mx.repeat(q, repeat_factor, -2)
+                k = mx.repeat(k, repeat_factor, -2)
+            # Start from pre-verify checkpoint state
+            state = self._checkpoint_cache[1]
+            # Replay only accepted positions
+            for t in range(position + 1):
+                _, state = _gated_delta_step_ops(
+                    q[:, t], k[:, t], v[:, t], g[:, t], beta[:, t], state
+                )
+            self.cache[1] = state
+
+        if self._conv_input is not None:
+            n_keep = self.conv_kernel_size - 1
+            # conv_input = [old_conv_state(n_keep), block_tokens(T)]
+            # We want the n_keep tokens ending at block position `position`
+            start_idx = position + 1  # offset for old conv_state prefix
+            end_idx = start_idx + n_keep
+            if end_idx <= self._conv_input.shape[1]:
+                self.cache[0] = mx.contiguous(
+                    self._conv_input[:, start_idx:end_idx, :]
+                )
+
+        self._recording = False
+        self._verify_qkvgb = None
+        self._conv_input = None
 
     def commit(self, up_to: int):
         """Mark tokens up to position as committed.

@@ -236,12 +236,12 @@ def block_diffusion_generate_step(
         block_output_ids[:, 1:] = mx.argmax(draft_logits, axis=-1)
 
         # === VERIFY PHASE ===
-        # Save checkpoint before verify (for rollback on rejection)
+        # Enable state recording on linear attention caches so we can restore
+        # to the acceptance position without a full rebuild forward pass.
         for c in target_cache:
-            if hasattr(c, 'save_checkpoint'):
-                c.save_checkpoint()
+            if hasattr(c, 'start_recording'):
+                c.start_recording()
 
-        # Run target model on block_output_ids to verify draft tokens
         verify_output = target_model_with_hidden(block_output_ids, cache=target_cache)
         mx.eval(verify_output.logits)
 
@@ -256,86 +256,36 @@ def block_diffusion_generate_step(
         )
         logger.debug(f"Acceptance: {acceptance_length}/{current_block_size - 1}")
 
-        # Finalize output: accepted draft tokens + bonus target token
-        output_ids[:, start: start + acceptance_length] = block_output_ids[:, :acceptance_length]
+        new_start = start + acceptance_length + 1
 
-        # Rollback target cache if tokens were rejected
-        if acceptance_length < current_block_size - 1:
-            # Some tokens rejected — rollback to checkpoint and rebuild
-            for c in target_cache:
-                if hasattr(c, 'rollback'):
-                    # SpeculativeArraysCache: restore checkpoint
-                    c.rollback()
-                elif hasattr(c, 'keys') and c.keys is not None:
-                    # KVCache: trim rejected tokens from end
-                    num_to_trim = current_block_size - (acceptance_length + 1)
-                    c.offset = c.offset - num_to_trim
+        # Fix cache state: restore linear attention to acceptance position,
+        # crop KVCache to accepted tokens only.
+        for c in target_cache:
+            if hasattr(c, 'restore_to_position'):
+                # SpeculativeArraysCache: restore recorded state
+                c.restore_to_position(acceptance_length)
+            elif hasattr(c, 'keys') and c.keys is not None:
+                # KVCache: adjust offset to keep only accepted tokens
+                if c.offset > new_start:
+                    c.offset = new_start
 
-            # Rebuild target cache with only accepted tokens first
-            # (don't include bonus yet — we need fresh logits to determine it)
-            if acceptance_length > 0:
-                rebuild_tokens = block_output_ids[:, :acceptance_length]
-            else:
-                rebuild_tokens = None
+        # Bonus and target_hidden from verify logits (valid for causal attention:
+        # position al only depends on positions 0..al)
+        bonus_token = posterior[:, acceptance_length].squeeze()
+        bonus_logits = verify_output.logits[:, acceptance_length, :]
 
-            if rebuild_tokens is not None:
-                rebuild_output = target_model_with_hidden(rebuild_tokens, cache=target_cache)
-                mx.eval(rebuild_output.logits)
-                # Get fresh bonus token from rebuild logits
-                bonus_token = mx.argmax(rebuild_output.logits[:, -1, :], axis=-1).squeeze(0)
-                bonus_logits = rebuild_output.logits[:, -1, :]
+        target_hidden = extract_context_feature(
+            verify_output.hidden_states, draft_model.target_layer_ids
+        )[:, :acceptance_length + 1, :]
+        mx.eval(target_hidden)
 
-                # Now feed the bonus token to update cache and get hidden states
-                bonus_input = bonus_token[None, None]
-                bonus_output = target_model_with_hidden(bonus_input, cache=target_cache)
-                mx.eval(bonus_output.logits)
+        # Place accepted tokens + bonus in output buffer
+        output_ids[:, start: start + acceptance_length + 1] = block_output_ids[:, :acceptance_length + 1]
+        output_ids[:, start + acceptance_length + 1] = bonus_token
 
-                # Combined hidden states: rebuild tokens + bonus token
-                rebuild_hidden = extract_context_feature(
-                    rebuild_output.hidden_states, draft_model.target_layer_ids
-                )
-                bonus_hidden = extract_context_feature(
-                    bonus_output.hidden_states, draft_model.target_layer_ids
-                )
-                target_hidden = mx.concatenate([rebuild_hidden, bonus_hidden], axis=1)
-                mx.eval(target_hidden)
-
-                saved_next_logits = bonus_output.logits[:, -1, :]
-            else:
-                # No accepted tokens — just get bonus token from verify logits at position 0
-                # This is OK because the cache was rolled back to pre-verify state
-                bonus_token = posterior[:, 0].squeeze()
-                bonus_logits = verify_output.logits[:, 0, :]
-
-                bonus_input = bonus_token[None, None]
-                bonus_output = target_model_with_hidden(bonus_input, cache=target_cache)
-                mx.eval(bonus_output.logits)
-
-                target_hidden = extract_context_feature(
-                    bonus_output.hidden_states, draft_model.target_layer_ids
-                )
-                mx.eval(target_hidden)
-
-                saved_next_logits = bonus_output.logits[:, -1, :]
-
-        else:
-            # Full acceptance: cache already has all tokens, no rollback needed
-            bonus_token = posterior[:, acceptance_length].squeeze()
-            bonus_logits = verify_output.logits[:, acceptance_length, :]
-
-            target_hidden = extract_context_feature(
-                verify_output.hidden_states, draft_model.target_layer_ids
-            )[:, :acceptance_length + 1, :]
-            mx.eval(target_hidden)
-
-            saved_next_logits = verify_output.logits[:, -1, :]
-
-        output_ids[:, start + acceptance_length] = bonus_token
-
-        # Yield accepted draft tokens
+        # Yield accepted draft tokens (positions 1..acceptance_length in block)
         for i in range(acceptance_length):
-            token_id = block_output_ids[0, i].item()
-            yield token_id, draft_logits[:, i, :], True
+            yield block_output_ids[0, i + 1].item(), draft_logits[:, i, :], True
             ntoks += 1
 
         # Yield bonus target token
@@ -343,7 +293,6 @@ def block_diffusion_generate_step(
         ntoks += 1
 
         # Crop draft cache to new start position
-        new_start = start + acceptance_length + 1
         _crop_cache(draft_cache, new_start)
 
         start = new_start

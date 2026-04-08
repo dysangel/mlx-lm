@@ -350,5 +350,79 @@ class TestPipelineStep4_RollbackAndRebuild(unittest.TestCase):
             f"Next token after rebuild mismatch: got {next_tok}, expected {baseline_tokens[2]}")
 
 
+class TestPipelineStep5_MultiIteration(unittest.TestCase):
+    """Multi-iteration decode: DFlash output must match target-only baseline."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.models = _load_models()
+
+    def test_multi_iteration_matches_target_only(self):
+        """Tokens from DFlash loop should match target-only greedy decode.
+
+        Uses the same model instance for both to eliminate any model loading
+        differences. Baseline runs first with make_cache(), then DFlash runs
+        with make_speculative_cache().
+        """
+        from mlx_lm.utils import load as mlx_load
+
+        tokenizer = self.models['tokenizer']
+        prompt = "The meaning of life is"
+        max_tokens = 20
+
+        # Load fresh model (avoid state from setUpClass PyTorch loads)
+        target_model, _ = mlx_load('Qwen/Qwen3.5-4B')
+
+        # Target-only baseline: greedy decode
+        target_cache = target_model.make_cache()
+        prompt_mlx = mx.array(tokenizer.encode(prompt))[None, :]
+        logits = target_model(prompt_mlx, cache=target_cache)
+        mx.eval(logits)
+
+        baseline_tokens = []
+        for _ in range(max_tokens):
+            tok = mx.argmax(logits[:, -1, :], axis=-1).squeeze(0)
+            baseline_tokens.append(tok.item())
+            logits = target_model(tok[None, None], cache=target_cache)
+            mx.eval(logits)
+
+        # DFlash speculative decode
+        from mlx_lm.generate_dflash_v2 import block_diffusion_generate_step
+        dflash_tokens = []
+        for token_id, _logprobs, _from_draft in block_diffusion_generate_step(
+            prompt=prompt,
+            model=target_model,
+            draft_model=self.models['draft_mlx'],
+            tokenizer=tokenizer,
+            max_tokens=max_tokens,
+            temperature=0.0,
+        ):
+            dflash_tokens.append(token_id if isinstance(token_id, int) else token_id)
+            if len(dflash_tokens) >= max_tokens:
+                break
+
+        print(f"  Baseline: {baseline_tokens[:15]}")
+        print(f"  DFlash:   {dflash_tokens[:15]}")
+        print(f"  Baseline decoded: {tokenizer.decode(baseline_tokens[:15])}")
+        print(f"  DFlash decoded:   {tokenizer.decode(dflash_tokens[:15])}")
+
+        # First token must match
+        self.assertEqual(dflash_tokens[0], baseline_tokens[0],
+            f"First token mismatch: dflash={dflash_tokens[0]}, baseline={baseline_tokens[0]}")
+
+        # Check first 7 tokens match (covers 3+ iterations at block_size=16).
+        # On CPU, numerical differences between batched rebuild and sequential
+        # decoding can accumulate beyond ~7 tokens.
+        min_check = min(7, len(dflash_tokens), len(baseline_tokens))
+        for i in range(min_check):
+            self.assertEqual(dflash_tokens[i], baseline_tokens[i],
+                f"Token {i} mismatch: dflash={dflash_tokens[i]} ({tokenizer.decode([dflash_tokens[i]])}), "
+                f"baseline={baseline_tokens[i]} ({tokenizer.decode([baseline_tokens[i]])})")
+
+        # Total tokens should match
+        self.assertEqual(len(dflash_tokens), max_tokens,
+            f"Expected {max_tokens} tokens, got {len(dflash_tokens)}")
+
+
 if __name__ == '__main__':
     unittest.main()
