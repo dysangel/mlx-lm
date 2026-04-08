@@ -1,6 +1,13 @@
 # Copyright © 2025 Apple Inc.
 
-"""Block diffusion speculative decoding using DFlash draft model."""
+"""Block diffusion speculative decoding using DFlash draft model.
+
+Aligned with the reference PyTorch implementation:
+- Persistent draft KVCache (cropped to `start` after each iteration)
+- target_hidden replaced each iteration (only acceptance_length + 1 tokens)
+- Position IDs span from draft cache length to block end
+- Target cache cropped to `start` after each iteration
+"""
 
 from typing import Any, Generator, List, Optional, Tuple, Union
 
@@ -9,7 +16,6 @@ import mlx.nn as nn
 
 from .models.cache import KVCache
 from .models.base import create_attention_mask, create_ssm_mask
-from .models.dflash_cache import DFlashDraftLayerCache, make_dflash_draft_cache
 from .sample_utils import make_sampler
 
 
@@ -31,6 +37,19 @@ def extract_context_feature(
     offset = 1  # hidden_states[0] is embedding, [1:] are layer outputs
     selected_states = [hidden_states[layer_id + offset] for layer_id in layer_ids]
     return mx.concatenate(selected_states, axis=-1)
+
+
+def _crop_cache(cache_list, target_len):
+    """Crop all caches in a list to target_len positions."""
+    for c in cache_list:
+        if hasattr(c, 'keys') and c.keys is not None:
+            # KVCache: uses offset to track real length, keys may be padded
+            if c.offset > target_len:
+                c.offset = target_len
+        elif hasattr(c, 'trim'):
+            current = c.offset if hasattr(c, 'offset') else 0
+            if current > target_len:
+                c.trim(current - target_len)
 
 
 class ModelWithHiddenStates(nn.Module):
@@ -98,11 +117,11 @@ def block_diffusion_generate_step(
 ) -> Generator[Tuple[int, mx.array, bool], None, None]:
     """Generate tokens using DFlash block diffusion speculative decoding.
 
-    Uses cache-based verification with the "saved logits" trick:
-    - After each cache update, save the logits from the last position
-    - Those logits predict what the first draft token (d0) should be
-    - During verification, feed only draft_tokens (no prev_token) to avoid duplication
-    - Compare: d0 vs saved_logits, d1 vs logits[0], d2 vs logits[1], ...
+    Follows the reference _spec_generate from dflash.py:
+    1. Persistent draft KVCache cropped to `start` after each iteration
+    2. target_hidden replaced with only the latest chunk each iteration
+    3. Position IDs span from draft cache length to block end
+    4. Target cache cropped to `start` after each iteration
 
     Yields:
         Tuple of (token_id, logprobs, from_draft)
@@ -137,240 +156,118 @@ def block_diffusion_generate_step(
     else:
         target_cache = model.make_cache()
 
+    # Persistent draft KVCache — accumulates across iterations, cropped to start
+    draft_cache = draft_model.make_cache()
+
     target_model_with_hidden = ModelWithHiddenStates(model, draft_model.target_layer_ids)
     target_inner = get_inner_model(model)
 
     # === PREFILL ===
     prompt_tokens = prompt_tokens[None, :]
-    prefill_logits = model(prompt_tokens, cache=target_cache)
-    mx.eval(prefill_logits)
+    prefill_output = target_model_with_hidden(prompt_tokens, cache=target_cache)
+    mx.eval(prefill_output.logits)
 
-    first_token = mx.argmax(prefill_logits[:, -1, :], axis=-1).squeeze(0).item()
-    yield first_token, prefill_logits[:, -1, :], False
-    ntoks = 1
+    # Sample first token and place it in output_ids
+    first_token = mx.argmax(prefill_output.logits[:, -1, :], axis=-1).squeeze(0)
 
-    # Extract target_hidden for draft model from prefill (without cache)
-    hidden_output = target_model_with_hidden(prompt_tokens, cache=None)
-    mx.eval(hidden_output.logits)
-    target_hidden = extract_context_feature(hidden_output.hidden_states, draft_model.target_layer_ids)
+    # Extract target_hidden from prefill — all prompt token hidden states
+    target_hidden = extract_context_feature(
+        prefill_output.hidden_states, draft_model.target_layer_ids
+    )
     mx.eval(target_hidden)
 
-    # Initialize output_ids
+    # Initialize output_ids buffer (matching reference layout)
     max_length = num_input_tokens + max_tokens + block_size
     output_ids = mx.full([1, max_length], mask_token_id, dtype=mx.uint32)
     output_ids[:, :num_input_tokens] = prompt_tokens
     output_ids[:, num_input_tokens] = first_token
 
-    start = num_input_tokens + 1
+    # Yield first token
+    yield first_token.item(), prefill_output.logits[:, -1, :], False
+    ntoks = 1
 
-    # Saved logits from the last cache update - predicts what the next token should be
-    saved_next_logits = None
-
-    # Persistent DFlash draft cache - accumulates verified noise K/V across iterations
-    draft_cache = make_dflash_draft_cache(draft_model.args.num_hidden_layers)
+    start = num_input_tokens  # Start at first generated token position
 
     # === DECODE LOOP ===
-    iteration = 0
-    while ntoks < max_tokens:
-        iteration += 1
-        remaining = max_tokens - ntoks
+    while start < num_input_tokens + max_tokens and ntoks < max_tokens:
+        remaining = num_input_tokens + max_tokens - start
         current_block_size = min(block_size, remaining)
-        logger.debug(f"Iteration {iteration}: ntoks={ntoks}, remaining={remaining}")
+        if current_block_size < 2:
+            break
 
-        if iteration > 1 and current_block_size > 1:
-            # === DRAFT PHASE ===
-            prev_token = output_ids[:, start - 1][:, None]
-            noise_tokens = mx.full([1, max(0, current_block_size - 1)], mask_token_id, dtype=mx.uint32)
-            draft_input = mx.concatenate([prev_token, noise_tokens], axis=-1)
-            noise_embedding = target_inner.embed_tokens(draft_input)
-            ctx_len = target_hidden.shape[1]
-            draft_position_ids = mx.arange(ctx_len + current_block_size)[None, :]
+        # === DRAFT PHASE ===
+        # Block: [prev_token_or_first, mask, mask, ...] (block_size tokens)
+        block_output_ids = mx.array(output_ids[:, start: start + current_block_size])
 
-            # Draft model uses fresh KVCache per iteration.
-            # DFlashDraftLayerCache accumulates verified noise K/V via commit()
-            # below, but isn't used as active cache yet due to growing attention cost.
-            draft_cache = draft_model.make_cache()
-            draft_output = draft_model(
-                position_ids=draft_position_ids,
-                noise_embedding=noise_embedding,
-                target_hidden=target_hidden,
-                cache=draft_cache,
-            )
-            mx.eval(draft_output)
+        # Draft model forward pass with persistent cache
+        noise_embedding = target_inner.embed_tokens(block_output_ids)
 
-            draft_logits = target_inner.embed_tokens.as_linear(draft_output)
-            mx.eval(draft_logits)
+        # Position IDs: from draft cache length to start + block_size
+        # This ensures cos/sin length matches K length (ctx_len + noise_len)
+        draft_cache_len = draft_cache[0].offset
+        draft_position_ids = mx.arange(
+            draft_cache_len, draft_cache_len + target_hidden.shape[1] + current_block_size
+        )[None, :]
 
-            if draft_logits.shape[1] > current_block_size - 1:
-                draft_tokens_block = mx.argmax(draft_logits[:, -current_block_size + 1:, :], axis=-1).squeeze(0)
-            else:
-                draft_tokens_block = mx.array([], dtype=mx.uint32)
+        draft_output = draft_model(
+            position_ids=draft_position_ids,
+            noise_embedding=noise_embedding,
+            target_hidden=target_hidden,
+            cache=draft_cache,
+        )
+        # Only take the last current_block_size-1 positions (skip prev_token)
+        draft_logits = target_inner.embed_tokens.as_linear(
+            draft_output[:, -current_block_size + 1:, :]
+        )
+        mx.eval(draft_logits)
 
-            # === VERIFY PHASE (combined verify + hidden state capture) ===
-            acceptance_length = 0
-            if draft_tokens_block.size > 0:
-                # Save cache state before verification (for rollback)
-                for c in target_cache:
-                    if hasattr(c, 'save_checkpoint'):
-                        c.save_checkpoint()
+        # Crop draft cache to start (discard speculative K/V beyond verified position)
+        _crop_cache(draft_cache, start)
 
-                # Use ModelWithHiddenStates to capture hidden states during verify
-                # This eliminates the separate rebuild step on full acceptance
-                verify_output = target_model_with_hidden(
-                    draft_tokens_block[None, :], cache=target_cache
-                )
-                mx.eval(verify_output.logits)
-                verify_logits = verify_output.logits
+        # Sample draft tokens (replace mask tokens with predictions)
+        block_output_ids[:, 1:] = mx.argmax(draft_logits, axis=-1)
 
-                draft_len = len(draft_tokens_block)
+        # === VERIFY PHASE ===
+        # Run target model on block_output_ids to verify draft tokens
+        verify_output = target_model_with_hidden(block_output_ids, cache=target_cache)
+        mx.eval(verify_output.logits)
 
-                if saved_next_logits is not None:
-                    d0_target = mx.argmax(saved_next_logits, axis=-1).squeeze(0)
-                    if draft_len > 1:
-                        d_rest_targets = mx.argmax(verify_logits[:, :-1, :], axis=-1).squeeze(0)
-                        target_tokens = mx.concatenate([d0_target[None], d_rest_targets])
-                    else:
-                        target_tokens = d0_target[None]
-                else:
-                    if draft_len > 1:
-                        target_tokens = mx.argmax(verify_logits[:, :-1, :], axis=-1).squeeze(0)
-                        target_tokens = mx.concatenate([mx.array([-1]), target_tokens])
-                    else:
-                        target_tokens = mx.array([-1])
+        # Sample posterior from target model
+        posterior = mx.argmax(verify_output.logits, axis=-1)
 
-                if logger.isEnabledFor(logging.DEBUG):
-                    draft_decoded = [tokenizer.decode([t]) for t in draft_tokens_block[:5].tolist()]
-                    target_decoded = [tokenizer.decode([t]) for t in target_tokens[:5].tolist()]
-                    logger.debug(f"Draft: {draft_tokens_block[:5].tolist()} -> {draft_decoded}")
-                    logger.debug(f"Target: {target_tokens[:5].tolist()} -> {target_decoded}")
+        # Compute acceptance: consecutive matches of draft vs target
+        draft_pred = block_output_ids[:, 1:]
+        target_pred = posterior[:, :-1]
+        acceptance_length = int(
+            (draft_pred == target_pred).cumprod(axis=1).sum().squeeze().item()
+        )
+        logger.debug(f"Acceptance: {acceptance_length}/{current_block_size - 1}")
 
-                acceptance_length = int(
-                    (mx.cumsum(draft_tokens_block == target_tokens) == mx.arange(1, len(target_tokens) + 1)).sum()
-                )
-                logger.debug(f"Acceptance: {acceptance_length}/{len(draft_tokens_block)}")
+        # Finalize output: accepted draft tokens + bonus target token
+        output_ids[:, start: start + acceptance_length] = block_output_ids[:, :acceptance_length]
+        bonus_token = posterior[:, acceptance_length].squeeze()
+        output_ids[:, start + acceptance_length] = bonus_token
 
-                # Yield accepted draft tokens
-                for i in range(acceptance_length):
-                    token_id = draft_tokens_block[i].item()
-                    output_ids[:, start + i] = token_id
-                    yield token_id, draft_logits[:, i + 1, :], True
-                    ntoks += 1
-                    if ntoks >= max_tokens:
-                        break
-
-                if ntoks >= max_tokens:
-                    break
-
-                # Yield target token
-                if acceptance_length == 0 and saved_next_logits is not None:
-                    target_logits = saved_next_logits
-                elif acceptance_length < len(draft_tokens_block):
-                    target_logits = verify_logits[:, acceptance_length - 1, :]
-                else:
-                    target_logits = verify_logits[:, -1, :]
-                target_token = mx.argmax(target_logits, axis=-1).squeeze(0)
-                output_ids[:, start + acceptance_length] = target_token
-                yield target_token.item(), target_logits, False
-                ntoks += 1
-
-                if ntoks >= max_tokens:
-                    break
-
-                # === CACHE UPDATE + TARGET HIDDEN UPDATE ===
-                if acceptance_length == draft_len:
-                    # FULL ACCEPTANCE: cache already has draft tokens from verify.
-                    # Extract hidden states from verify pass, then feed only target_token.
-                    verify_hidden = extract_context_feature(
-                        verify_output.hidden_states,
-                        draft_model.target_layer_ids,
-                    )
-                    mx.eval(verify_hidden)
-
-                    target_token_input = mx.array([[target_token.item()]])
-                    next_output = target_model_with_hidden(
-                        target_token_input, cache=target_cache
-                    )
-                    mx.eval(next_output.logits)
-                    saved_next_logits = next_output.logits[:, -1, :]
-
-                    target_hidden_new = extract_context_feature(
-                        next_output.hidden_states,
-                        draft_model.target_layer_ids,
-                    )
-                    mx.eval(target_hidden_new)
-                    target_hidden = mx.concatenate(
-                        [target_hidden, verify_hidden, target_hidden_new], axis=1
-                    )
-                    logger.debug(f"Full acceptance: skipped rebuild, fed 1 token instead of {draft_len + 1}")
-                else:
-                    # PARTIAL/ZERO ACCEPTANCE: rollback ALL draft tokens, then rebuild.
-                    # Rollback ALL (not just rejected) to avoid KVCache duplication bug.
-                    for c in target_cache:
-                        if hasattr(c, 'rollback'):
-                            c.rollback()
-                        elif hasattr(c, 'keys') and c.keys is not None:
-                            new_offset = c.offset - draft_len
-                            c.offset = new_offset
-                            c.keys = c.keys[..., :new_offset, :]
-                            c.values = c.values[..., :new_offset, :]
-                    logger.debug(f"Rolled back all {draft_len} draft tokens from cache")
-
-                    if acceptance_length > 0:
-                        rebuild_tokens = mx.concatenate([
-                            draft_tokens_block[:acceptance_length][None, :],
-                            mx.array([[target_token.item()]])
-                        ], axis=-1)
-                    else:
-                        rebuild_tokens = mx.array([[target_token.item()]])
-                    rebuild_output = target_model_with_hidden(rebuild_tokens, cache=target_cache)
-                    mx.eval(rebuild_output.logits)
-
-                    saved_next_logits = rebuild_output.logits[:, -1, :]
-
-                    new_hidden = extract_context_feature(
-                        rebuild_output.hidden_states,
-                        draft_model.target_layer_ids,
-                    )
-                    mx.eval(new_hidden)
-                    target_hidden = mx.concatenate([target_hidden, new_hidden], axis=1)
-
-                # Commit accepted noise K/V to the persistent draft cache
-                for dc in draft_cache:
-                    if hasattr(dc, '_last_noise_k') and dc._last_noise_k is not None:
-                        dc.commit(dc._last_noise_k, dc._last_noise_v, acceptance_length + 1)
-
-                start += acceptance_length + 1
-        else:
-            # === ITERATION 1: Single token decode ===
-            prev_token = mx.array([[first_token]])
-            decode_logits = model(prev_token, cache=target_cache)
-            mx.eval(decode_logits)
-
-            target_token = mx.argmax(decode_logits[:, -1, :], axis=-1).squeeze(0)
-            output_ids[:, start] = target_token
-            yield target_token.item(), decode_logits[:, -1, :], False
+        # Yield accepted draft tokens
+        for i in range(acceptance_length):
+            token_id = block_output_ids[0, i].item()
+            yield token_id, draft_logits[:, i, :], True
             ntoks += 1
 
-            if ntoks >= max_tokens:
-                break
+        # Yield bonus target token
+        yield bonus_token.item(), verify_output.logits[:, acceptance_length, :], False
+        ntoks += 1
 
-            # Add first_token + target_token to cache and extract hidden states
-            iter1_tokens = mx.array([[first_token, target_token.item()]])
-            update_output = target_model_with_hidden(iter1_tokens, cache=target_cache)
-            mx.eval(update_output.logits)
-            saved_next_logits = update_output.logits[:, -1, :]
+        # Update target_hidden: only the accepted chunk (matching reference line 279)
+        target_hidden = extract_context_feature(
+            verify_output.hidden_states, draft_model.target_layer_ids
+        )[:, :acceptance_length + 1, :]
+        mx.eval(target_hidden)
 
-            # Append both tokens' hidden states to target_hidden
-            new_hidden = extract_context_feature(
-                update_output.hidden_states,
-                draft_model.target_layer_ids,
-            )
-            mx.eval(new_hidden)
-            target_hidden = mx.concatenate([target_hidden, new_hidden], axis=1)
+        # Crop target cache to new start position
+        new_start = start + acceptance_length + 1
+        _crop_cache(target_cache, new_start)
 
-            start += 1
-
-        if ntoks >= max_tokens:
-            break
+        start = new_start
 
     return

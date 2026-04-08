@@ -357,74 +357,37 @@ class TestDFlashModelForward(unittest.TestCase):
         self.assertEqual(output.shape, (B, block_size, args.hidden_size))
 
 
-class TestDFlashDraftLayerCache(unittest.TestCase):
-    """Test DFlashDraftLayerCache behavior."""
+class TestCropCache(unittest.TestCase):
+    """Test _crop_cache helper."""
 
-    def test_empty_cache(self):
-        """Empty cache should just pass through new K/V."""
-        from mlx_lm.models.dflash_cache import DFlashDraftLayerCache
+    def test_crop_kvcache(self):
+        """Crop KVCache to target length."""
+        from mlx_lm.generate_dflash_v2 import _crop_cache
+        from mlx_lm.models.cache import KVCache
 
-        cache = DFlashDraftLayerCache()
-        k = mx.array(np.random.randn(1, 2, 10, 8).astype(np.float32))
-        v = mx.array(np.random.randn(1, 2, 10, 8).astype(np.float32))
+        cache = KVCache()
+        k = mx.ones((2, 1, 10, 8), dtype=mx.float32)
+        v = mx.ones((2, 1, 10, 8), dtype=mx.float32)
+        k, v = cache.update_and_fetch(k, v)
+        mx.eval(k, v)
 
-        k_out, v_out = cache.combine(k, v)
-        np.testing.assert_array_equal(np.array(k_out), np.array(k))
-        np.testing.assert_array_equal(np.array(v_out), np.array(v))
+        self.assertEqual(cache.offset, 10)
+        _crop_cache([cache], 5)
+        self.assertEqual(cache.offset, 5)
 
-    def test_commit_and_combine(self):
-        """After commit, combine should prepend cached K/V."""
-        from mlx_lm.models.dflash_cache import DFlashDraftLayerCache
+    def test_crop_already_shorter(self):
+        """Crop to length greater than current is a no-op."""
+        from mlx_lm.generate_dflash_v2 import _crop_cache
+        from mlx_lm.models.cache import KVCache
 
-        cache = DFlashDraftLayerCache()
+        cache = KVCache()
+        k = mx.ones((2, 1, 3, 8), dtype=mx.float32)
+        v = mx.ones((2, 1, 3, 8), dtype=mx.float32)
+        k, v = cache.update_and_fetch(k, v)
+        mx.eval(k, v)
 
-        # First: commit some noise K/V
-        noise_k = mx.ones((1, 2, 3, 8), dtype=mx.float32)
-        noise_v = mx.ones((1, 2, 3, 8), dtype=mx.float32) * 2
-        cache.commit(noise_k, noise_v, 3)
-
-        self.assertEqual(cache.cached_len, 3)
-
-        # Now combine with new K/V
-        new_k = mx.ones((1, 2, 5, 8), dtype=mx.float32) * 3
-        new_v = mx.ones((1, 2, 5, 8), dtype=mx.float32) * 4
-        k_out, v_out = cache.combine(new_k, new_v)
-
-        # Should be cached (3) + new (5) = 8 total
-        self.assertEqual(k_out.shape, (1, 2, 8, 8))
-        self.assertEqual(v_out.shape, (1, 2, 8, 8))
-
-        # First 3 should be from cache (1.0), last 5 from new (3.0)
-        np.testing.assert_allclose(np.array(k_out[:, :, :3, :]), 1.0)
-        np.testing.assert_allclose(np.array(k_out[:, :, 3:, :]), 3.0)
-
-    def test_multiple_commits(self):
-        """Multiple commits should accumulate K/V."""
-        from mlx_lm.models.dflash_cache import DFlashDraftLayerCache
-
-        cache = DFlashDraftLayerCache()
-
-        k1 = mx.array(np.ones((1, 2, 2, 8), dtype=np.float32))
-        v1 = mx.array(np.ones((1, 2, 2, 8), dtype=np.float32) * 2)
-        cache.commit(k1, v1, 2)
-
-        k2 = mx.ones((1, 2, 3, 8), dtype=mx.float32) * 3
-        v2 = mx.ones((1, 2, 3, 8), dtype=mx.float32) * 4
-        cache.commit(k2, v2, 3)
-
-        self.assertEqual(cache.cached_len, 5)
-        self.assertEqual(cache.cached_k.shape, (1, 2, 5, 8))
-
-    def test_commit_zero(self):
-        """Commit with 0 should be a no-op."""
-        from mlx_lm.models.dflash_cache import DFlashDraftLayerCache
-
-        cache = DFlashDraftLayerCache()
-        k = mx.ones((1, 2, 3, 8), dtype=mx.float32)
-        cache.commit(k, k, 0)
-
-        self.assertEqual(cache.cached_len, 0)
-        self.assertIsNone(cache.cached_k)
+        _crop_cache([cache], 10)  # Crop to longer than current
+        self.assertEqual(cache.offset, 3)  # Should stay at 3
 
 
 if __name__ == '__main__':

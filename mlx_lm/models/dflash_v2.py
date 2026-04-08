@@ -12,7 +12,6 @@ import mlx.nn as nn
 
 from .cache import KVCache
 from .base import scaled_dot_product_attention
-from .dflash_cache import DFlashDraftLayerCache
 from .activations import swiglu
 
 
@@ -180,22 +179,13 @@ class DFlashAttention(nn.Module):
         cos, sin = position_embeddings
         queries, k = apply_rotary_pos_emb(queries, k, cos, sin)
 
-        # Update cache - support both standard KVCache and DFlashDraftLayerCache
+        # Update cache - standard KVCache append
         if cache is not None:
-            if isinstance(cache, DFlashDraftLayerCache):
-                # Custom cache: combine cached noise + new context/noise
-                # Store noise portion for later commit
-                cache._last_noise_k = k[:, :, ctx_len:, :]
-                cache._last_noise_v = v[:, :, ctx_len:, :]
-                k, v = cache.combine(k, v)
-            else:
-                # Standard KVCache: append all K/V
-                k, v = cache.update_and_fetch(k, v)
+            k, v = cache.update_and_fetch(k, v)
 
         # Scaled dot-product attention
-        attn_cache = cache if not isinstance(cache, DFlashDraftLayerCache) else None
         output = scaled_dot_product_attention(
-            queries, k, v, cache=attn_cache, scale=self.scaling, mask=mask
+            queries, k, v, cache=cache, scale=self.scaling, mask=mask
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
