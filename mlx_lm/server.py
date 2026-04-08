@@ -369,6 +369,15 @@ class ModelProvider:
             self.draft_model, draft_tokenizer = load(draft_model_path)
             validate_draft_tokenizer(draft_tokenizer)
 
+        # Quantize draft model if requested
+        if (
+            self.draft_model is not None
+            and getattr(self.cli_args, "quantize_draft", False)
+        ):
+            import mlx.nn as nn
+            nn.quantize(self.draft_model, group_size=64, bits=4)
+            logger.info("Quantized draft model to 4-bit")
+
         if self.draft_model is None:
             self.is_batchable = all(
                 hasattr(c, "merge") for c in make_prompt_cache(self.model)
@@ -550,10 +559,12 @@ class ResponseGenerator:
         # Choose the initial state among only reasoning or normal
         initial_state = "normal"
         if tokenizer.has_thinking:
-            think_start = tokenizer.rfind_think_start(prompt)
-            think_end = tokenizer.rfind_think_end(prompt)
-            if think_start > think_end:
-                initial_state = "reasoning"
+            for i in range(-1, -len(prompt), -1):
+                if prompt[i] == tokenizer.think_start_id:
+                    initial_state = "reasoning"
+                    break
+                if prompt[i] == tokenizer.think_end_id:
+                    break
 
         # It is not a user message so no segmentation needed.
         if messages[-1]["role"] != "user":
@@ -588,9 +599,10 @@ class ResponseGenerator:
         # tokens)
         tail_start = len(prompt)
         if tokenizer.has_thinking:
-            think_start = tokenizer.rfind_think_start(prompt, start=tail_start - 11)
-            if think_start >= 0:
-                tail_start = think_start
+            for i in range(1, min(11, len(prompt) - sys_end), 1):
+                if prompt[-i] == tokenizer.think_start_id:
+                    tail_start = len(prompt) - i
+                    break
 
         # Finalize the segments and return
         if sys_end < tail_start:
@@ -638,18 +650,22 @@ class ResponseGenerator:
 
         # Reasoning related transitions
         if tokenizer.has_thinking:
-            ts = tokenizer.think_start_tokens
-            te = tokenizer.think_end_tokens
-            transitions["normal"].append((ts, "reasoning"))
-            transitions["reasoning"] = [(te, "normal")]
+            ts = tokenizer.think_start_id
+            te = tokenizer.think_end_id
+            transitions["normal"].append(((ts,), "reasoning"))
+            transitions["reasoning"] = [((te,), "normal")]
             transitions["reasoning"].extend(common_stops)
-            sequences[ts] = tokenizer.think_start
-            sequences[te] = tokenizer.think_end
+            sequences[(ts,)] = tokenizer.convert_ids_to_tokens(ts)
+            sequences[(te,)] = tokenizer.convert_ids_to_tokens(te)
 
         # Tool calling relating transitions
         if tokenizer.has_tool_calling:
-            ts = tokenizer.tool_call_start_tokens
-            te = tokenizer.tool_call_end_tokens
+            ts = tuple(
+                tokenizer.encode(tokenizer.tool_call_start, add_special_tokens=False)
+            )
+            te = tuple(
+                tokenizer.encode(tokenizer.tool_call_end, add_special_tokens=False)
+            )
             transitions["normal"].append((ts, "tool"))
             transitions["tool"] = [(te, "normal")]
             transitions["tool"].extend(common_stops)
@@ -1338,13 +1354,12 @@ class APIHandler(BaseHTTPRequestHandler):
         # Add dynamic response
         if self.object_type.startswith("chat.completion"):
             key_name = "delta" if self.stream else "message"
-            choice[key_name] = {"role": "assistant"}
-            if text:
-                choice[key_name]["content"] = text
-            if reasoning_text:
-                choice[key_name]["reasoning"] = reasoning_text
-            if tool_calls:
-                choice[key_name]["tool_calls"] = tool_calls
+            choice[key_name] = {
+                "role": "assistant",
+                "content": text,
+                "reasoning": reasoning_text,
+                "tool_calls": tool_calls,
+            }
         elif self.object_type == "text_completion":
             choice.update(text=text)
         else:
@@ -1770,6 +1785,11 @@ def main():
         type=str,
         help="A model to be used for speculative decoding.",
         default=None,
+    )
+    parser.add_argument(
+        "--quantize-draft",
+        action="store_true",
+        help="Quantize the draft model to 4-bit after loading for faster inference.",
     )
     parser.add_argument(
         "--num-draft-tokens",

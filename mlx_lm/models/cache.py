@@ -596,12 +596,35 @@ class ArraysCache(_BaseCache):
         instance = super().__new__(cls)
         instance.left_padding = None
         instance.lengths = None
+        instance._offset = 0
         return instance
 
     def __init__(self, size, left_padding: Optional[List[int]] = None):
         self.cache = [None] * size
         if left_padding:
             self.left_padding = mx.array(left_padding)
+
+    @property
+    def offset(self):
+        """Get current offset based on actual array size."""
+        if self.cache[0] is not None:
+            return self.cache[0].shape[1] if len(self.cache[0].shape) >= 2 else 0
+        return 0
+
+    @offset.setter
+    def offset(self, value):
+        """Set offset manually (for testing or special cases)."""
+        self._offset = value
+
+    def __getitem__(self, idx):
+        """Return cache entry, respecting offset for sequence arrays."""
+        arr = self.cache[idx]
+        # If this is a sequence array (has rank >= 2), slice by offset
+        if arr is not None:
+            shape = arr.shape
+            if len(shape) >= 2:  # Sequence dimension is axis 1
+                return arr[:, :self.offset, ...]
+        return arr
 
     def __setitem__(self, idx, value):
         self.cache[idx] = value
@@ -637,7 +660,13 @@ class ArraysCache(_BaseCache):
                 return a
             return mx.concatenate([a, b])
 
+        old_offset = self.offset
         self.cache = [cat(c, o) for c, o in zip(self.cache, other.cache)]
+        # Update offset to track the new total length
+        if self.cache[0] is not None:
+            self.offset = self.cache[0].shape[1]
+        else:
+            self.offset = old_offset
 
     def extract(self, idx):
         cache = ArraysCache(len(self.cache))
@@ -650,6 +679,26 @@ class ArraysCache(_BaseCache):
     def finalize(self):
         self.lengths = None
         self.left_padding = None
+
+    def size(self):
+        """Return the current valid size based on actual arrays."""
+        return self.offset
+
+    def trim(self, n: int) -> int:
+        """Trim n tokens by slicing arrays."""
+        if self.cache[0] is None:
+            return 0
+        current_len = self.cache[0].shape[1] if len(self.cache[0].shape) >= 2 else 0
+        n = min(n, current_len)
+        keep_len = current_len - n
+        if keep_len > 0:
+            for i in range(len(self.cache)):
+                if self.cache[i] is not None:
+                    self.cache[i] = self.cache[i][:, :keep_len, ...]
+        return n
+
+    def is_trimmable(self):
+        return True
 
     def advance(self, N):
         if self.lengths is not None:
@@ -1381,10 +1430,9 @@ class BatchRotatingKVCache(_BaseCache):
         self._offset = max(self._offset, other._offset)
 
     def extract(self, idx):
-        mx.eval(self.left_padding, self.offset)
         cache = RotatingKVCache(self.max_size)
-        padding = max(0, self.left_padding.tolist()[idx])
-        offset = self.offset.tolist()[idx]
+        padding = self.left_padding[idx].item()
+        offset = self.offset[idx].item()
         cache.keys = self.keys[idx : idx + 1]
         cache.values = self.values[idx : idx + 1]
         cache._idx = self._idx
@@ -1425,8 +1473,8 @@ class BatchRotatingKVCache(_BaseCache):
         for i, (p, l, c) in enumerate(zip(padding, lengths, caches)):
             if c.keys is None:
                 continue
-            keys[i : i + 1, :, p : p + l] = c._temporal_order(c.keys)[..., -l:, :]
-            values[i : i + 1, :, p : p + l] = c._temporal_order(c.values)[..., -l:, :]
+            keys[i : i + 1, :, p : p + l] = c._temporal_order(c.keys)
+            values[i : i + 1, :, p : p + l] = c._temporal_order(c.values)
 
         cache = cls(caches[0].max_size, padding)
         cache.keys = keys
@@ -1448,42 +1496,6 @@ class BatchRotatingKVCache(_BaseCache):
         if self.keys is None:
             return 0
         return self.keys.nbytes + self.values.nbytes
-
-
-class TokenBuffer:
-    """A simple token buffer that can be efficiently appended to in a similar
-    fashion to the KVCache.
-
-    Perhaps these could share some logic in the future.
-    """
-
-    step = 256
-
-    def __init__(self, tokens=[]):
-        self._buffer = mx.array(tokens, dtype=mx.int32)
-        self._size = len(tokens)
-
-    def update_and_fetch(self, tokens):
-        start = self._size
-        end = start + len(tokens)
-
-        new_size = ((end + self.step - 1) // self.step) * self.step
-        if new_size > self._buffer.size:
-            self._buffer = mx.concatenate(
-                [self._buffer, mx.zeros(new_size - self._buffer.size, dtype=mx.int32)]
-            )
-        self._buffer[start:end] = tokens
-        self._size = end
-
-        return self._buffer[:end]
-
-    @property
-    def state(self):
-        return self._buffer
-
-    @property
-    def tokens(self):
-        return self._buffer[: self._size]
 
 
 @dataclass
