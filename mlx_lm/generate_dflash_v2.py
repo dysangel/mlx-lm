@@ -107,7 +107,6 @@ def block_diffusion_generate_step(
         Tuple of (token_id, logprobs, from_draft)
     """
     import logging
-    logging.basicConfig(level=logging.DEBUG)
     logger = logging.getLogger(__name__)
 
     sampler = kwargs.get("sampler")
@@ -293,9 +292,9 @@ def block_diffusion_generate_step(
                 if ntoks >= max_tokens:
                     break
 
-                # === CACHE UPDATE ===
+                # === CACHE UPDATE + TARGET HIDDEN ===
                 # After rollback, cache is missing accepted tokens + target token
-                # Rebuild cache with only the accepted tokens
+                # Rebuild cache AND incrementally append target_hidden (no O(n²) rerun)
                 if acceptance_length > 0:
                     rebuild_tokens = mx.concatenate([
                         draft_tokens_block[:acceptance_length][None, :],
@@ -303,22 +302,20 @@ def block_diffusion_generate_step(
                     ], axis=-1)
                 else:
                     rebuild_tokens = mx.array([[target_token.item()]])
-                rebuild_logits = model(rebuild_tokens, cache=target_cache)
-                mx.eval(rebuild_logits)
+                rebuild_output = target_model_with_hidden(rebuild_tokens, cache=target_cache)
+                mx.eval(rebuild_output.logits)
 
                 # Save logits for next iteration's d0 comparison
-                saved_next_logits = rebuild_logits[:, -1, :]
+                saved_next_logits = rebuild_output.logits[:, -1, :]
 
-                # === TARGET HIDDEN REBUILD ===
-                total_tokens = start + acceptance_length + 1
-                all_tokens_array = output_ids[:, :total_tokens]
-                hidden_output = target_model_with_hidden(all_tokens_array, cache=None)
-                mx.eval(hidden_output.logits)
-                target_hidden = extract_context_feature(
-                    hidden_output.hidden_states,
+                # Incrementally append new hidden states to target_hidden
+                # This avoids the O(n²) full-sequence rerun while maintaining full context
+                new_hidden = extract_context_feature(
+                    rebuild_output.hidden_states,
                     draft_model.target_layer_ids,
                 )
-                mx.eval(target_hidden)
+                mx.eval(new_hidden)
+                target_hidden = mx.concatenate([target_hidden, new_hidden], axis=1)
 
                 start += acceptance_length + 1
         else:
@@ -335,21 +332,20 @@ def block_diffusion_generate_step(
             if ntoks >= max_tokens:
                 break
 
-            # Add target_token to cache + save its logits for next iteration's d0 comparison
-            update_logits = model(mx.array([[target_token.item()]]), cache=target_cache)
-            mx.eval(update_logits)
-            saved_next_logits = update_logits[:, -1, :]
+            # Add first_token + target_token to cache and extract hidden states incrementally
+            # Both tokens need the prompt context (via cache) for correct hidden states
+            iter1_tokens = mx.array([[first_token, target_token.item()]])
+            update_output = target_model_with_hidden(iter1_tokens, cache=target_cache)
+            mx.eval(update_output.logits)
+            saved_next_logits = update_output.logits[:, -1, :]
 
-            # Rebuild target_hidden
-            total_tokens = start + 1
-            all_tokens_array = output_ids[:, :total_tokens]
-            hidden_output = target_model_with_hidden(all_tokens_array, cache=None)
-            mx.eval(hidden_output.logits)
-            target_hidden = extract_context_feature(
-                hidden_output.hidden_states,
+            # Incrementally append both tokens' hidden states to target_hidden
+            new_hidden = extract_context_feature(
+                update_output.hidden_states,
                 draft_model.target_layer_ids,
             )
-            mx.eval(target_hidden)
+            mx.eval(new_hidden)
+            target_hidden = mx.concatenate([target_hidden, new_hidden], axis=1)
 
             start += 1
 
