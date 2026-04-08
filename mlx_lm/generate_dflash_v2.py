@@ -219,15 +219,15 @@ def block_diffusion_generate_step(
     # Position for next token
     start = num_input_tokens + 1
 
-    # Decode loop - simplified: just use target model for now
+    # Decode loop - target only for baseline
+    # TODO: Add draft model verification once cache corruption is fixed
     iteration = 0
     while ntoks < max_tokens:
         iteration += 1
         remaining = max_tokens - ntoks
-        current_block_size = min(block_size, remaining)
         logger.debug(f"Iteration {iteration}: ntoks={ntoks}, remaining={remaining}")
 
-        # Use target model directly - skip draft for now to get baseline
+        # Use target model directly
         with mx.stream(generation_stream):
             last_token_id = output_ids[:, start - 1].item()
             token_input = mx.array([[last_token_id]])
