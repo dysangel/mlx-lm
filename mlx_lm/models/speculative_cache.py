@@ -18,8 +18,9 @@ import logging
 from typing import Any, List, Optional
 
 import mlx.core as mx
+import mlx.nn as nn
 
-from .cache import _BaseCache, ArraysCache
+from .cache import _BaseCache, ArraysCache, KVCache
 
 logger = logging.getLogger(__name__)
 
