@@ -202,18 +202,8 @@ def block_diffusion_generate_step(
     yield first_token, first_logprobs, False
     ntoks = 1
 
-    # Extract context features from target model (only prompt tokens, not first generated token)
-    # This matches the reference which uses only prompt context for initial materialization
-    target_hidden = extract_context_feature(
-        target_model_with_hidden.hidden_states,
-        draft_model.target_layer_ids,
-    )
-
-    # Yield first token
-    first_token = tokens[-1].item()
-    first_logprobs = logprobs[-1]
-    yield first_token, first_logprobs, False
-    ntoks = 1
+    # Initialize accumulated_tokens with first generated token
+    accumulated_tokens = [first_token]
 
     # Extract context features from target model (only prompt tokens, not first generated token)
     # This matches the reference which uses only prompt context for initial materialization
@@ -221,14 +211,7 @@ def block_diffusion_generate_step(
         target_model_with_hidden.hidden_states,
         draft_model.target_layer_ids,
     )
-
-    # Materialize target context into draft cache ONCE
     ctx_len = target_hidden.shape[1]
-    ctx_position_ids = mx.arange(ctx_len)[None, :]
-    draft_model.materialize_target_hidden(target_hidden, draft_cache, ctx_position_ids)
-
-    # Update noise_start to track where noise tokens begin (after context)
-    draft_cache.update_noise_start(ctx_len)
 
     # Get inner model for embeddings
     target_inner = get_inner_model(model)
@@ -260,7 +243,7 @@ def block_diffusion_generate_step(
             logger.debug(f"Start of iteration {iteration}: KVCache offset = {kvcache_offset}")
 
         with mx.stream(generation_stream):
-            # Generate draft tokens (but don't use them yet)
+            # Generate draft tokens (iteration 2+)
             if iteration > 1:
                 prev_token = output_ids[:, start - 1][:, None]
                 noise_tokens = mx.zeros([1, max(0, current_block_size - 1)], dtype=mx.uint32)
@@ -268,8 +251,9 @@ def block_diffusion_generate_step(
                 noise_embedding = target_inner.embed_tokens(draft_input)
 
                 # Use draft cache (now re-materialized with correct context)
-                cache_size = draft_cache.total_size()
-                noise_position_ids = mx.arange(cache_size, cache_size + current_block_size)[None, :]
+                # Position IDs should be ABSOLUTE positions in the full sequence
+                # ctx_len is the length of target_hidden (prompt + all accepted tokens)
+                noise_position_ids = mx.arange(ctx_len, ctx_len + current_block_size)[None, :]
 
                 # Call draft model with target_hidden
                 draft_output = draft_model(
@@ -296,7 +280,7 @@ def block_diffusion_generate_step(
                 logger.debug(f"Draft tokens (first 5): {draft_tokens_block[:5].tolist() if draft_tokens_block.size > 0 else []}")
 
                 # Construct draft tokens for verification (prepend first_token as seed)
-                draft_tokens = mx.concatenate([mx.array([last_token_id]), draft_tokens_block])
+                draft_tokens = mx.concatenate([mx.array([first_token]), draft_tokens_block])
 
                 # Verify draft tokens
                 acceptance_length = 0
@@ -309,7 +293,8 @@ def block_diffusion_generate_step(
 
                     # Verify draft_to_verify (skip seed token)
                     draft_to_verify = draft_tokens[1:][None, :]
-                    logits = model(draft_to_verify, cache=target_cache)
+                    output = target_model_with_hidden(draft_to_verify, cache=target_cache)
+                    logits = output.logits
                     mx.eval(logits)
 
                     # Get target predictions
@@ -350,34 +335,57 @@ def block_diffusion_generate_step(
                     if ntoks >= max_tokens:
                         break
 
-                    # Yield accepted draft tokens
-                    for i in range(acceptance_length):
-                        yield draft_tokens[i + 1].item(), draft_logits[:, i, :], True
-                        ntoks += 1
-                        if ntoks >= max_tokens:
-                            break
-
-                    if ntoks >= max_tokens:
-                        break
-
                     # Yield one target token (from verification step)
                     target_token = mx.argmax(logits[:, -1, :], axis=-1).squeeze(0)
                     yield target_token.item(), logits[:, -1, :], False
                     ntoks += 1
 
-                    # Accumulate the target token for next iteration
+                    # Track the target token we just yielded
                     accumulated_tokens.append(target_token.item())
 
-                    # Rebuild target_hidden with the new token
+                    # Rebuild accumulated_hidden from FULL sequence
+                    # Verification only gives hidden states for new tokens, need full context
                     accumulated_tokens_mx = mx.array(accumulated_tokens)[None, :]
                     _ = target_model_with_hidden(accumulated_tokens_mx, cache=None)
+                    accumulated_hidden = target_model_with_hidden.hidden_states.copy()
+
+                    # Extract target_hidden from updated accumulated_hidden
                     target_hidden = extract_context_feature(
-                        target_model_with_hidden.hidden_states,
+                        accumulated_hidden,
                         draft_model.target_layer_ids,
                     )
 
                     if ntoks >= max_tokens:
                         break
+            else:
+                # Iteration 1: Generate one target token directly (no draft)
+                # Get the last token as context
+                prev_token = mx.array([[first_token]])
+                output = target_model_with_hidden(prev_token, cache=target_cache)
+                logits = output.logits
+                mx.eval(logits)
+
+                # Sample and yield target token
+                target_token = mx.argmax(logits[:, -1, :], axis=-1).squeeze(0)
+                yield target_token.item(), logits[:, -1, :], False
+                ntoks += 1
+
+                # Track the target token
+                accumulated_tokens.append(target_token.item())
+
+                # Rebuild accumulated_hidden from FULL sequence
+                accumulated_tokens_mx = mx.array(accumulated_tokens)[None, :]
+                _ = target_model_with_hidden(accumulated_tokens_mx, cache=None)
+                accumulated_hidden = target_model_with_hidden.hidden_states.copy()
+
+                # Extract target_hidden from updated accumulated_hidden
+                target_hidden = extract_context_feature(
+                    accumulated_hidden,
+                    draft_model.target_layer_ids,
+                )
+
+                if ntoks >= max_tokens:
+                    break
 
         # Clear cache periodically
         if ntoks % 256 == 0:

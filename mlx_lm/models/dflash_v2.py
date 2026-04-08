@@ -20,6 +20,19 @@ def rotate_half(x: mx.array) -> mx.array:
     return mx.concatenate([-x2, x1], axis=-1)
 
 
+def apply_rotary_pos_emb_single(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
+    """Apply RoPE to a single tensor (for applying to subset of k)."""
+    cos = mx.expand_dims(cos, 0)
+    sin = mx.expand_dims(sin, 0)
+
+    # Concatenate cos/sin with themselves to match head_dim
+    cos = mx.concatenate([cos, cos], axis=-1)
+    sin = mx.concatenate([sin, sin], axis=-1)
+
+    x_embed = (x * cos) + (rotate_half(x) * sin)
+    return x_embed
+
+
 def apply_rotary_pos_emb(
     q: mx.array, k: mx.array, cos: mx.array, sin: mx.array
 ) -> Tuple[mx.array, mx.array]:
@@ -160,9 +173,15 @@ class DFlashAttention(nn.Module):
         k = self.k_norm(k).transpose(0, 2, 1, 3)
         v = v.transpose(0, 2, 1, 3)
 
-        # Apply RoPE
+        # Apply RoPE - only to noise part of k, not context part
+        # Context keys (k_ctx) should not have RoPE applied
         cos, sin = position_embeddings
-        queries, k = apply_rotary_pos_emb(queries, k, cos, sin)
+        queries = apply_rotary_pos_emb_single(queries, cos, sin)
+        # Split k into context and noise parts, apply RoPE only to noise part
+        k_ctx_final = k[..., :ctx_len, :]  # Context part, no RoPE
+        k_noise_final = k[..., ctx_len:, :]  # Noise part, apply RoPE
+        k_noise_final = apply_rotary_pos_emb_single(k_noise_final, cos, sin)
+        k = mx.concatenate([k_ctx_final, k_noise_final], axis=-2)
 
         # Update cache
         if cache is not None:
