@@ -1,9 +1,81 @@
 # Copyright © 2025 Apple Inc.
 
-"""Custom KV cache with cropping support for DFlash."""
+"""DFlash draft model cache implementations.
+
+Contains:
+- DFlashDraftLayerCache: Per-layer cache for cross-attention that separates
+  context K/V (replaced each iteration) from noise K/V (accumulated).
+- CroppableKVCache: Simple KV cache with cropping support (legacy).
+- DFlashCacheManager: Manages CroppableKVCache instances (legacy).
+"""
 
 from typing import Optional, Tuple, List, Any
 import mlx.core as mx
+
+
+class DFlashDraftLayerCache:
+    """Per-layer cache for DFlash draft model cross-attention.
+
+    DFlash attention concatenates K/V from target_hidden (context) and
+    noise_embedding (noise). Standard KVCache doesn't work well because
+    context changes each iteration.
+
+    This cache stores verified NOISE K/V across iterations (the draft model's
+    own historical processing), while context K/V are replaced each iteration.
+
+    The attention sees: cached_noise + new_context + new_noise
+    """
+
+    def __init__(self):
+        self.cached_k = None  # [B, H, cached_len, D]
+        self.cached_v = None  # [B, H, cached_len, D]
+        self.cached_len = 0
+
+    def combine(self, new_k, new_v):
+        """Combine cached noise K/V with new K/V for attention.
+
+        New K/V already have RoPE applied. Cached K/V already have RoPE
+        from their original positions.
+
+        Args:
+            new_k: [B, H, ctx_len + noise_len, D] - new K with RoPE
+            new_v: [B, H, ctx_len + noise_len, D] - new V
+
+        Returns:
+            Combined (K, V) for attention computation.
+        """
+        if self.cached_k is not None:
+            k = mx.concatenate([self.cached_k, new_k], axis=2)
+            v = mx.concatenate([self.cached_v, new_v], axis=2)
+        else:
+            k = new_k
+            v = new_v
+        return k, v
+
+    def commit(self, noise_k, noise_v, num_to_cache):
+        """Save accepted noise K/V to the cache after verification.
+
+        Args:
+            noise_k: [B, H, noise_len, D] - noise portion of K (with RoPE)
+            noise_v: [B, H, noise_len, D] - noise portion of V
+            num_to_cache: number of accepted entries to cache
+        """
+        if num_to_cache <= 0:
+            return
+        accepted_k = noise_k[:, :, :num_to_cache, :]
+        accepted_v = noise_v[:, :, :num_to_cache, :]
+        if self.cached_k is not None:
+            self.cached_k = mx.concatenate([self.cached_k, accepted_k], axis=2)
+            self.cached_v = mx.concatenate([self.cached_v, accepted_v], axis=2)
+        else:
+            self.cached_k = accepted_k
+            self.cached_v = accepted_v
+        self.cached_len += num_to_cache
+
+
+def make_dflash_draft_cache(num_layers):
+    """Create a list of DFlashDraftLayerCache, one per draft model layer."""
+    return [DFlashDraftLayerCache() for _ in range(num_layers)]
 
 
 class CroppableKVCache:

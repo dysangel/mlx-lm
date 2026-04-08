@@ -4,6 +4,7 @@
 # Reference: https://github.com/jianc99/dflash
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
@@ -11,6 +12,7 @@ import mlx.nn as nn
 
 from .cache import KVCache
 from .base import scaled_dot_product_attention
+from .dflash_cache import DFlashDraftLayerCache
 from .activations import swiglu
 
 
@@ -20,6 +22,7 @@ def rotate_half(x: mx.array) -> mx.array:
     return mx.concatenate([-x2, x1], axis=-1)
 
 
+@mx.compile
 def apply_rotary_pos_emb_single(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
     """Apply RoPE to a single tensor (for applying to subset of k)."""
     cos = mx.expand_dims(cos, 0)
@@ -33,6 +36,7 @@ def apply_rotary_pos_emb_single(x: mx.array, cos: mx.array, sin: mx.array) -> mx
     return x_embed
 
 
+@mx.compile
 def apply_rotary_pos_emb(
     q: mx.array, k: mx.array, cos: mx.array, sin: mx.array
 ) -> Tuple[mx.array, mx.array]:
@@ -178,13 +182,22 @@ class DFlashAttention(nn.Module):
         cos, sin = position_embeddings
         queries, k = apply_rotary_pos_emb(queries, k, cos, sin)
 
-        # Update cache
+        # Update cache - support both standard KVCache and DFlashDraftLayerCache
         if cache is not None:
-            k, v = cache.update_and_fetch(k, v)
+            if isinstance(cache, DFlashDraftLayerCache):
+                # Custom cache: combine cached noise + new context/noise
+                # Store noise portion for later commit
+                cache._last_noise_k = k[:, :, ctx_len:, :]
+                cache._last_noise_v = v[:, :, ctx_len:, :]
+                k, v = cache.combine(k, v)
+            else:
+                # Standard KVCache: append all K/V
+                k, v = cache.update_and_fetch(k, v)
 
         # Scaled dot-product attention
+        attn_cache = cache if not isinstance(cache, DFlashDraftLayerCache) else None
         output = scaled_dot_product_attention(
-            queries, k, v, cache=cache, scale=self.scaling, mask=mask
+            queries, k, v, cache=attn_cache, scale=self.scaling, mask=mask
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
