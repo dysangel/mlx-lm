@@ -206,7 +206,7 @@ def block_diffusion_generate_step(
             else:
                 draft_tokens_block = mx.array([], dtype=mx.uint32)
 
-            # === VERIFY PHASE (cache-based, no prev_token duplication) ===
+            # === VERIFY PHASE (combined verify + hidden state capture) ===
             acceptance_length = 0
             if draft_tokens_block.size > 0:
                 # Save cache state before verification (for rollback)
@@ -214,8 +214,13 @@ def block_diffusion_generate_step(
                     if hasattr(c, 'save_checkpoint'):
                         c.save_checkpoint()
 
-                verify_logits = model(draft_tokens_block[None, :], cache=target_cache)
-                mx.eval(verify_logits)
+                # Use ModelWithHiddenStates to capture hidden states during verify
+                # This eliminates the separate rebuild step on full acceptance
+                verify_output = target_model_with_hidden(
+                    draft_tokens_block[None, :], cache=target_cache
+                )
+                mx.eval(verify_output.logits)
+                verify_logits = verify_output.logits
 
                 draft_len = len(draft_tokens_block)
 
@@ -244,19 +249,6 @@ def block_diffusion_generate_step(
                 )
                 logger.debug(f"Acceptance: {acceptance_length}/{len(draft_tokens_block)}")
 
-                # Rollback cache if tokens were rejected
-                if acceptance_length < len(draft_tokens_block):
-                    num_to_trim = draft_len - acceptance_length
-                    for c in target_cache:
-                        if hasattr(c, 'rollback'):
-                            c.rollback()
-                        elif hasattr(c, 'keys') and c.keys is not None:
-                            new_offset = c.offset - num_to_trim
-                            c.offset = new_offset
-                            c.keys = c.keys[..., :new_offset, :]
-                            c.values = c.values[..., :new_offset, :]
-                    logger.debug(f"Rolled back {num_to_trim} rejected tokens from cache")
-
                 # Yield accepted draft tokens
                 for i in range(acceptance_length):
                     token_id = draft_tokens_block[i].item()
@@ -284,28 +276,63 @@ def block_diffusion_generate_step(
                 if ntoks >= max_tokens:
                     break
 
-                # === CACHE REBUILD + TARGET HIDDEN UPDATE ===
-                # After rollback, cache is missing accepted tokens + target token.
-                # Rebuild cache AND extract target_hidden in one pass (incremental append).
-                if acceptance_length > 0:
-                    rebuild_tokens = mx.concatenate([
-                        draft_tokens_block[:acceptance_length][None, :],
-                        mx.array([[target_token.item()]])
-                    ], axis=-1)
+                # === CACHE UPDATE + TARGET HIDDEN UPDATE ===
+                if acceptance_length == draft_len:
+                    # FULL ACCEPTANCE: cache already has draft tokens from verify.
+                    # Extract hidden states from verify pass, then feed only target_token.
+                    verify_hidden = extract_context_feature(
+                        verify_output.hidden_states,
+                        draft_model.target_layer_ids,
+                    )
+                    mx.eval(verify_hidden)
+
+                    target_token_input = mx.array([[target_token.item()]])
+                    next_output = target_model_with_hidden(
+                        target_token_input, cache=target_cache
+                    )
+                    mx.eval(next_output.logits)
+                    saved_next_logits = next_output.logits[:, -1, :]
+
+                    target_hidden_new = extract_context_feature(
+                        next_output.hidden_states,
+                        draft_model.target_layer_ids,
+                    )
+                    mx.eval(target_hidden_new)
+                    target_hidden = mx.concatenate(
+                        [target_hidden, verify_hidden, target_hidden_new], axis=1
+                    )
+                    logger.debug(f"Full acceptance: skipped rebuild, fed 1 token instead of {draft_len + 1}")
                 else:
-                    rebuild_tokens = mx.array([[target_token.item()]])
-                rebuild_output = target_model_with_hidden(rebuild_tokens, cache=target_cache)
-                mx.eval(rebuild_output.logits)
+                    # PARTIAL/ZERO ACCEPTANCE: rollback ALL draft tokens, then rebuild.
+                    # Rollback ALL (not just rejected) to avoid KVCache duplication bug.
+                    for c in target_cache:
+                        if hasattr(c, 'rollback'):
+                            c.rollback()
+                        elif hasattr(c, 'keys') and c.keys is not None:
+                            new_offset = c.offset - draft_len
+                            c.offset = new_offset
+                            c.keys = c.keys[..., :new_offset, :]
+                            c.values = c.values[..., :new_offset, :]
+                    logger.debug(f"Rolled back all {draft_len} draft tokens from cache")
 
-                saved_next_logits = rebuild_output.logits[:, -1, :]
+                    if acceptance_length > 0:
+                        rebuild_tokens = mx.concatenate([
+                            draft_tokens_block[:acceptance_length][None, :],
+                            mx.array([[target_token.item()]])
+                        ], axis=-1)
+                    else:
+                        rebuild_tokens = mx.array([[target_token.item()]])
+                    rebuild_output = target_model_with_hidden(rebuild_tokens, cache=target_cache)
+                    mx.eval(rebuild_output.logits)
 
-                # Incrementally append new hidden states to target_hidden
-                new_hidden = extract_context_feature(
-                    rebuild_output.hidden_states,
-                    draft_model.target_layer_ids,
-                )
-                mx.eval(new_hidden)
-                target_hidden = mx.concatenate([target_hidden, new_hidden], axis=1)
+                    saved_next_logits = rebuild_output.logits[:, -1, :]
+
+                    new_hidden = extract_context_feature(
+                        rebuild_output.hidden_states,
+                        draft_model.target_layer_ids,
+                    )
+                    mx.eval(new_hidden)
+                    target_hidden = mx.concatenate([target_hidden, new_hidden], axis=1)
 
                 # Commit accepted noise K/V to the persistent draft cache
                 for dc in draft_cache:
