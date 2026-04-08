@@ -2,7 +2,7 @@
 
 """Custom KV cache with cropping support for DFlash."""
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Any
 import mlx.core as mx
 
 
@@ -58,15 +58,35 @@ class CroppableKVCache:
         """Update cache and fetch current state (API compatible with KVCache)."""
         return self.update(k, v)
 
+    def to_axes(self, kv_pos: int, axis: int) -> Tuple[int, ...]:
+        """API compatibility for prompt cache construction."""
+        return (kv_pos, axis)
+
 
 class DFlashCacheManager:
-    """Manages caches for DFlash with cropping support."""
+    """Manages caches for DFlash with cropping support.
+
+    This class is designed to be compatible with the expected list-of-caches
+    interface used by MLX-LM's generation code.
+    """
 
     def __init__(self, num_layers: int, block_size: int):
         self.num_layers = num_layers
         self.block_size = block_size
         self.caches = [CroppableKVCache() for _ in range(num_layers)]
         self.noise_start = 0  # Position where noise tokens start
+
+    def __iter__(self):
+        """Make the manager iterable like a list of caches."""
+        return iter(self.caches)
+
+    def __len__(self):
+        """Return the number of layers (for list compatibility)."""
+        return self.num_layers
+
+    def __getitem__(self, index):
+        """Allow indexing like a list."""
+        return self.caches[index]
 
     def update_layer(self, layer_idx: int, k: mx.array, v: mx.array) -> Tuple[mx.array, mx.array]:
         """Update a specific layer's cache."""

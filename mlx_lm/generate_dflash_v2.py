@@ -120,10 +120,17 @@ def block_diffusion_generate_step(
         draft_model: DFlash draft model
         tokenizer: Tokenizer
         max_tokens: Maximum tokens to generate
+        **kwargs: Additional arguments (sampler, logits_processors, etc.)
 
     Yields:
         Tuple of (token_id, logprobs, from_draft)
     """
+    import logging
+    logging.basicConfig(level=logging.DEBUG)
+    logger = logging.getLogger(__name__)
+    logger.info(f"DFlash generation started: prompt='{prompt[:50]}...', max_tokens={max_tokens}")
+    logger.info(f"kwargs keys: {list(kwargs.keys())}")
+
     # Helper function for sampling
     def process_sample(logits):
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
@@ -232,6 +239,9 @@ def block_diffusion_generate_step(
             else:
                 draft_logits = target_inner.embed_tokens.as_linear(draft_output)
 
+            # Force evaluation
+            mx.eval(draft_logits)
+
             # Sample draft tokens (skip first position which is the seed token)
             draft_tokens_block = mx.argmax(draft_logits[:, -current_block_size + 1:, :], axis=-1).squeeze(0)
 
@@ -245,7 +255,9 @@ def block_diffusion_generate_step(
             # Predict next token from target model using current cache state
             # Use a repeat of the last token to trigger prediction
             last_token_id = output_ids[:, start - 1].item()
-            target_output = target_model_with_hidden(mx.array([[last_token_id]]), cache=target_cache)
+            token_input = mx.array([[last_token_id]])
+            target_output = target_model_with_hidden(token_input, cache=target_cache)
+            mx.eval(target_output.logits)
             final_token = sampler(target_output.logits[0, -1:, :])[0].item()
 
             # Update output_ids
@@ -267,6 +279,10 @@ def block_diffusion_generate_step(
             target_logprobs = target_output.logits - mx.logsumexp(target_output.logits, axis=-1, keepdims=True)
             yield final_token, target_logprobs[:, -1, :].squeeze(0), False
             ntoks += 1
+
+            # Clear cache periodically to prevent memory buildup
+            if ntoks % 256 == 0:
+                mx.clear_cache()
 
             if ntoks >= max_tokens:
                 break
