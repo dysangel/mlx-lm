@@ -106,13 +106,8 @@ class SpeculativeArraysCache(_BaseCache):
         return self._committed_up_to
 
     def __getitem__(self, idx):
-        """Return cache entry, respecting offset for sequence arrays."""
-        arr = self.cache[idx]
-        if arr is not None:
-            shape = arr.shape
-            if len(shape) >= 2:
-                return arr[:, :self.offset, ...]
-        return arr
+        """Return cache entry directly (same as ArraysCache)."""
+        return self.cache[idx]
 
     def __setitem__(self, idx, value):
         """Set cache entry at index."""

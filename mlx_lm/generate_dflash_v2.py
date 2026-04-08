@@ -254,15 +254,24 @@ def block_diffusion_generate_step(
 
             logger.debug(f"Draft tokens: {draft_tokens_block[:5].tolist() if draft_tokens_block.size > 0 else []}")
 
-            # === VERIFY PHASE (without cache) ===
+            # === VERIFY PHASE ===
+            # Verify by passing ALL tokens (prompt + generated + draft) without cache
+            # This is correct but O(n^2) - can optimize later with proper rollback
             acceptance_length = 0
             if draft_tokens_block.size > 0:
-                verification_input = mx.concatenate([prev_token, draft_tokens_block[None, :]], axis=-1)
-                verify_output = target_model_with_hidden(verification_input, cache=None)
+                # Build full verification input: prompt + generated + draft
+                draft_len = len(draft_tokens_block)
+                full_verify_input = output_ids[:, :start]  # prompt + all generated
+                full_verify_input = mx.concatenate([full_verify_input, draft_tokens_block[None, :]], axis=-1)
+                verify_output = target_model_with_hidden(full_verify_input, cache=None)
                 logits = verify_output.logits
                 mx.eval(logits)
 
-                target_tokens = mx.argmax(logits[:, :-1, :], axis=-1).squeeze(0)
+                # Target predictions for draft positions
+                # logits has one prediction per input token; we want predictions at draft positions
+                draft_len = len(draft_tokens_block)
+                # Predictions for draft token positions: from -draft_len-1 to -1
+                target_tokens = mx.argmax(logits[:, -draft_len - 1:-1, :], axis=-1).squeeze(0)
 
                 if logger.isEnabledFor(logging.DEBUG):
                     draft_decoded = [tokenizer.decode([t]) for t in draft_tokens_block[:5].tolist()]
@@ -289,20 +298,23 @@ def block_diffusion_generate_step(
                     break
 
                 # Yield target token
-                target_token = mx.argmax(logits[:, -1, :], axis=-1).squeeze(0)
+                # Target token comes from the prediction AFTER the last accepted draft token,
+                # NOT from the last position (which is poisoned by rejected draft tokens)
+                target_logits = logits[:, start - 1 + acceptance_length, :]
+                target_token = mx.argmax(target_logits, axis=-1).squeeze(0)
                 output_ids[:, start + acceptance_length] = target_token
-                yield target_token.item(), logits[:, -1, :], False
+                yield target_token.item(), target_logits, False
                 ntoks += 1
 
                 if ntoks >= max_tokens:
                     break
 
-                # === CACHE UPDATE (with ORIGINAL model) ===
-                # Feed new tokens through original model to update cache
-                # new_tokens = accepted draft tokens + target token
-                new_tokens = output_ids[:, start:start + acceptance_length + 1]
-                logger.debug(f"Updating cache with {acceptance_length + 1} tokens via original model")
-                cache_logits = model(new_tokens, cache=target_cache)
+                # === CACHE UPDATE ===
+                # Always rebuild cache from scratch with accepted tokens
+                # (since we verified without cache, the cache is stale)
+                accepted_plus_target = output_ids[:, start:start + acceptance_length + 1]
+                logger.debug(f"Updating cache with {acceptance_length + 1} tokens")
+                cache_logits = model(accepted_plus_target, cache=target_cache)
                 mx.eval(cache_logits)
 
                 # === TARGET HIDDEN REBUILD (without cache) ===
