@@ -246,7 +246,8 @@ def block_diffusion_generate_step(
             # Generate draft tokens (iteration 2+)
             if iteration > 1:
                 prev_token = output_ids[:, start - 1][:, None]
-                noise_tokens = mx.zeros([1, max(0, current_block_size - 1)], dtype=mx.uint32)
+                # Use mask_token_id for noise positions (reference: output_ids initialized with mask)
+                noise_tokens = mx.full([1, max(0, current_block_size - 1)], mask_token_id, dtype=mx.uint32)
                 draft_input = mx.concatenate([prev_token, noise_tokens], axis=-1) if current_block_size > 1 else prev_token
                 noise_embedding = target_inner.embed_tokens(draft_input)
 
@@ -343,17 +344,17 @@ def block_diffusion_generate_step(
                     # Track the target token we just yielded
                     accumulated_tokens.append(target_token.item())
 
-                    # Rebuild accumulated_hidden from FULL sequence
-                    # Verification only gives hidden states for new tokens, need full context
-                    accumulated_tokens_mx = mx.array(accumulated_tokens)[None, :]
-                    _ = target_model_with_hidden(accumulated_tokens_mx, cache=None)
-                    accumulated_hidden = target_model_with_hidden.hidden_states.copy()
-
-                    # Extract target_hidden from updated accumulated_hidden
+                    # Update target_hidden using output.hidden_states from verification step
+                    # Reference: extract_context_feature(output.hidden_states, ...)[:, :acceptance_length + 1, :]
+                    # Slice to keep only accepted tokens + 1 target token (sliding window)
                     target_hidden = extract_context_feature(
-                        accumulated_hidden,
+                        target_model_with_hidden.hidden_states,
                         draft_model.target_layer_ids,
-                    )
+                    )[:, :acceptance_length + 1, :]
+                    mx.eval(target_hidden)
+
+                    # Update ctx_len to match current target_hidden size
+                    ctx_len = target_hidden.shape[1]
 
                     if ntoks >= max_tokens:
                         break
@@ -373,16 +374,15 @@ def block_diffusion_generate_step(
                 # Track the target token
                 accumulated_tokens.append(target_token.item())
 
-                # Rebuild accumulated_hidden from FULL sequence
-                accumulated_tokens_mx = mx.array(accumulated_tokens)[None, :]
-                _ = target_model_with_hidden(accumulated_tokens_mx, cache=None)
-                accumulated_hidden = target_model_with_hidden.hidden_states.copy()
-
-                # Extract target_hidden from updated accumulated_hidden
+                # Update target_hidden using sliding window (acceptance_length = 1 for iteration 1)
                 target_hidden = extract_context_feature(
-                    accumulated_hidden,
+                    target_model_with_hidden.hidden_states,
                     draft_model.target_layer_ids,
-                )
+                )[:, :1, :]
+                mx.eval(target_hidden)
+
+                # Update ctx_len to match current target_hidden size
+                ctx_len = target_hidden.shape[1]
 
                 if ntoks >= max_tokens:
                     break
