@@ -166,6 +166,9 @@ def block_diffusion_generate_step(
     # Saved logits from the last cache update - predicts what the next token should be
     saved_next_logits = None
 
+    # Persistent DFlash draft cache - accumulates verified noise K/V across iterations
+    draft_cache = make_dflash_draft_cache(draft_model.args.num_hidden_layers)
+
     # === DECODE LOOP ===
     iteration = 0
     while ntoks < max_tokens:
@@ -183,6 +186,9 @@ def block_diffusion_generate_step(
             ctx_len = target_hidden.shape[1]
             draft_position_ids = mx.arange(ctx_len + current_block_size)[None, :]
 
+            # Draft model uses fresh KVCache per iteration.
+            # DFlashDraftLayerCache accumulates verified noise K/V via commit()
+            # below, but isn't used as active cache yet due to growing attention cost.
             draft_cache = draft_model.make_cache()
             draft_output = draft_model(
                 position_ids=draft_position_ids,
@@ -300,6 +306,11 @@ def block_diffusion_generate_step(
                 )
                 mx.eval(new_hidden)
                 target_hidden = mx.concatenate([target_hidden, new_hidden], axis=1)
+
+                # Commit accepted noise K/V to the persistent draft cache
+                for dc in draft_cache:
+                    if hasattr(dc, '_last_noise_k') and dc._last_noise_k is not None:
+                        dc.commit(dc._last_noise_k, dc._last_noise_v, acceptance_length + 1)
 
                 start += acceptance_length + 1
         else:

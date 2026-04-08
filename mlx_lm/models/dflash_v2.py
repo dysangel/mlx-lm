@@ -22,7 +22,6 @@ def rotate_half(x: mx.array) -> mx.array:
     return mx.concatenate([-x2, x1], axis=-1)
 
 
-@mx.compile
 def apply_rotary_pos_emb_single(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
     """Apply RoPE to a single tensor (for applying to subset of k)."""
     cos = mx.expand_dims(cos, 0)
@@ -36,7 +35,6 @@ def apply_rotary_pos_emb_single(x: mx.array, cos: mx.array, sin: mx.array) -> mx
     return x_embed
 
 
-@mx.compile
 def apply_rotary_pos_emb(
     q: mx.array, k: mx.array, cos: mx.array, sin: mx.array
 ) -> Tuple[mx.array, mx.array]:
