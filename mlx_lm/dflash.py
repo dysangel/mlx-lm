@@ -36,6 +36,7 @@ def setup_arg_parser():
     parser.add_argument("--temp", type=float, default=0.0, help="Sampling temperature.")
     parser.add_argument("--top-p", type=float, default=1.0, help="Top-p sampling.")
     parser.add_argument("--seed", type=int, default=None, help="Random seed.")
+    parser.add_argument("--block-size", type=int, default=None, help="Override block size.")
     parser.add_argument(
         "--verbose", action="store_true", help="Print per-iteration stats."
     )
@@ -53,6 +54,9 @@ def main():
     target_model, tokenizer = load(args.target)
     print(f"Loading draft model: {args.draft}", file=sys.stderr)
     draft_model, _ = load(args.draft)
+
+    if args.block_size is not None:
+        draft_model.block_size = args.block_size
 
     sampler = make_sampler(temp=args.temp, top_p=args.top_p)
 
