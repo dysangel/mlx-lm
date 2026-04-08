@@ -258,8 +258,6 @@ def block_diffusion_generate_step(
 
         # Finalize output: accepted draft tokens + bonus target token
         output_ids[:, start: start + acceptance_length] = block_output_ids[:, :acceptance_length]
-        bonus_token = posterior[:, acceptance_length].squeeze()
-        output_ids[:, start + acceptance_length] = bonus_token
 
         # Rollback target cache if tokens were rejected
         if acceptance_length < current_block_size - 1:
@@ -273,29 +271,66 @@ def block_diffusion_generate_step(
                     num_to_trim = current_block_size - (acceptance_length + 1)
                     c.offset = c.offset - num_to_trim
 
-            # Rebuild target cache with only accepted + bonus tokens
+            # Rebuild target cache with only accepted tokens first
+            # (don't include bonus yet — we need fresh logits to determine it)
             if acceptance_length > 0:
-                rebuild_tokens = mx.concatenate([
-                    block_output_ids[:, :acceptance_length],
-                    bonus_token[None, None],
-                ], axis=-1)
+                rebuild_tokens = block_output_ids[:, :acceptance_length]
             else:
-                rebuild_tokens = bonus_token[None, None]
-            rebuild_output = target_model_with_hidden(rebuild_tokens, cache=target_cache)
-            mx.eval(rebuild_output.logits)
+                rebuild_tokens = None
 
-            # Use rebuild logits and hidden states
-            target_hidden = extract_context_feature(
-                rebuild_output.hidden_states, draft_model.target_layer_ids
-            )[:, :acceptance_length + 1, :]
-            mx.eval(target_hidden)
+            if rebuild_tokens is not None:
+                rebuild_output = target_model_with_hidden(rebuild_tokens, cache=target_cache)
+                mx.eval(rebuild_output.logits)
+                # Get fresh bonus token from rebuild logits
+                bonus_token = mx.argmax(rebuild_output.logits[:, -1, :], axis=-1).squeeze(0)
+                bonus_logits = rebuild_output.logits[:, -1, :]
+
+                # Now feed the bonus token to update cache and get hidden states
+                bonus_input = bonus_token[None, None]
+                bonus_output = target_model_with_hidden(bonus_input, cache=target_cache)
+                mx.eval(bonus_output.logits)
+
+                # Combined hidden states: rebuild tokens + bonus token
+                rebuild_hidden = extract_context_feature(
+                    rebuild_output.hidden_states, draft_model.target_layer_ids
+                )
+                bonus_hidden = extract_context_feature(
+                    bonus_output.hidden_states, draft_model.target_layer_ids
+                )
+                target_hidden = mx.concatenate([rebuild_hidden, bonus_hidden], axis=1)
+                mx.eval(target_hidden)
+
+                saved_next_logits = bonus_output.logits[:, -1, :]
+            else:
+                # No accepted tokens — just get bonus token from verify logits at position 0
+                # This is OK because the cache was rolled back to pre-verify state
+                bonus_token = posterior[:, 0].squeeze()
+                bonus_logits = verify_output.logits[:, 0, :]
+
+                bonus_input = bonus_token[None, None]
+                bonus_output = target_model_with_hidden(bonus_input, cache=target_cache)
+                mx.eval(bonus_output.logits)
+
+                target_hidden = extract_context_feature(
+                    bonus_output.hidden_states, draft_model.target_layer_ids
+                )
+                mx.eval(target_hidden)
+
+                saved_next_logits = bonus_output.logits[:, -1, :]
 
         else:
             # Full acceptance: cache already has all tokens, no rollback needed
+            bonus_token = posterior[:, acceptance_length].squeeze()
+            bonus_logits = verify_output.logits[:, acceptance_length, :]
+
             target_hidden = extract_context_feature(
                 verify_output.hidden_states, draft_model.target_layer_ids
             )[:, :acceptance_length + 1, :]
             mx.eval(target_hidden)
+
+            saved_next_logits = verify_output.logits[:, -1, :]
+
+        output_ids[:, start + acceptance_length] = bonus_token
 
         # Yield accepted draft tokens
         for i in range(acceptance_length):
@@ -304,7 +339,7 @@ def block_diffusion_generate_step(
             ntoks += 1
 
         # Yield bonus target token
-        yield bonus_token.item(), verify_output.logits[:, acceptance_length, :], False
+        yield bonus_token.item(), bonus_logits, False
         ntoks += 1
 
         # Crop draft cache to new start position
