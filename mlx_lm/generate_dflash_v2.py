@@ -181,11 +181,13 @@ def block_diffusion_generate_step(
             noise_tokens = mx.full([1, max(0, current_block_size - 1)], mask_token_id, dtype=mx.uint32)
             draft_input = mx.concatenate([prev_token, noise_tokens], axis=-1)
             noise_embedding = target_inner.embed_tokens(draft_input)
-            noise_position_ids = mx.arange(start, start + current_block_size)[None, :]
+            # Position IDs must cover full context + noise range for RoPE on full K
+            ctx_len = target_hidden.shape[1]
+            draft_position_ids = mx.arange(ctx_len + current_block_size)[None, :]
 
             draft_cache = draft_model.make_cache()
             draft_output = draft_model(
-                position_ids=noise_position_ids,
+                position_ids=draft_position_ids,
                 noise_embedding=noise_embedding,
                 target_hidden=target_hidden,
                 cache=draft_cache,

@@ -173,15 +173,10 @@ class DFlashAttention(nn.Module):
         k = self.k_norm(k).transpose(0, 2, 1, 3)
         v = v.transpose(0, 2, 1, 3)
 
-        # Apply RoPE - only to noise part of k, not context part
-        # Context keys (k_ctx) should not have RoPE applied
+        # Apply RoPE to both Q and full K (context + noise)
+        # Reference applies RoPE uniformly to all of K, with Q using last q_len positions
         cos, sin = position_embeddings
-        queries = apply_rotary_pos_emb_single(queries, cos, sin)
-        # Split k into context and noise parts, apply RoPE only to noise part
-        k_ctx_final = k[..., :ctx_len, :]  # Context part, no RoPE
-        k_noise_final = k[..., ctx_len:, :]  # Noise part, apply RoPE
-        k_noise_final = apply_rotary_pos_emb_single(k_noise_final, cos, sin)
-        k = mx.concatenate([k_ctx_final, k_noise_final], axis=-2)
+        queries, k = apply_rotary_pos_emb(queries, k, cos, sin)
 
         # Update cache
         if cache is not None:
@@ -270,10 +265,8 @@ class RoPE(nn.Module):
         t = position_ids[:, None]  # (seq_len, 1)
         freqs = t * inv_freq[None, :]  # (seq_len, rotary_dim/2)
 
-        emb = mx.concatenate([mx.sin(freqs), mx.cos(freqs)], axis=-1)  # (seq_len, rotary_dim)
-
-        cos = emb[:, : emb.shape[-1] // 2]  # (seq_len, rotary_dim/2)
-        sin = emb[:, emb.shape[-1] // 2 :]  # (seq_len, rotary_dim/2)
+        cos = mx.cos(freqs)  # (seq_len, rotary_dim/2)
+        sin = mx.sin(freqs)  # (seq_len, rotary_dim/2)
 
         return cos, sin
 
