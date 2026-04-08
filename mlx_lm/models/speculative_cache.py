@@ -141,8 +141,7 @@ class SpeculativeArraysCache(_BaseCache):
         """Rollback cache to last checkpoint, discarding all speculative tokens.
 
         This is an O(1) operation - we just reset the committed_up_to pointer.
-        The cache arrays are not modified; invalid tokens are ignored via the
-        committed_up_to check.
+        The cache arrays are sliced to remove speculative tokens.
 
         This should be called when draft tokens are rejected by the target model.
         """
@@ -150,12 +149,11 @@ class SpeculativeArraysCache(_BaseCache):
         self._committed_up_to = self._checkpoint_committed_up_to
         logger.debug(f"SpeculativeArraysCache: rollback from {old_committed} to {self._committed_up_to}")
 
-        # Reset offset to committed position
-        if self.cache[0] is not None:
-            # Slice cache to committed position
-            committed_len = min(self._committed_up_to, self.cache[0].shape[1])
+        # Slice cache arrays to committed position
+        if self.cache[0] is not None and self.cache[0].shape[1] > self._committed_up_to:
+            committed_len = self._committed_up_to
             for i in range(len(self.cache)):
-                if self.cache[i] is not None:
+                if self.cache[i] is not None and self.cache[i].shape[1] > committed_len:
                     self.cache[i] = self.cache[i][:, :committed_len, ...]
 
     def commit(self, up_to: int):
